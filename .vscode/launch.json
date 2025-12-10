@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    //
+    // To debug with root privileges:
+    //   1. Build: cargo build
+    //   2. In terminal: ./debug-as-root.sh (or: sudo lldb-server gdbserver localhost:1234 ./target/debug/k8stun)
+    //   3. Use "Attach to lldb-server (root)" configuration below
+    //
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug unit tests in executable 'k8stun'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=k8stun"
+                ]
+            }
+        }
+    ]
+}
