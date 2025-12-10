@@ -1,0 +1,77 @@
+[package]
+name = "k8stun"
+version = "0.1.0"
+edition = "2021"
+description = "Kubernetes Userspace Network Tunnel - transparent access to K8s services"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tsroka/k8stun"
+homepage = "https://github.com/tsroka/k8stun"
+readme = "README.md"
+keywords = ["kubernetes", "networking", "tunnel", "vpn", "k8s"]
+categories = ["network-programming", "command-line-utilities"]
+authors = ["Tomek Sroka"]
+
+[dependencies]
+# TUN device management
+tun2 = { version = "4.0.0", features = ["async"] }
+
+# Userspace TCP/IP stack (lwIP-based)
+lwip = "0.3.15"
+
+# Kubernetes client
+kube = { version = "0.98.0", features = ["client", "runtime", "ws"] }
+k8s-openapi = { version = "0.24.0", features = ["v1_32"] }
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+futures = "0.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Networking utilities
+bytes = "1.9"
+etherparse = "0.16"
+netdev = "0.37"
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Lock-free data structures
+arc-swap = "1.7"
+
+# DNS protocol
+hickory-proto = "0.25"
+
+# Async utilities
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Debian package configuration
+[package.metadata.deb]
+maintainer = "Tomek Sroka <tomek@sroka.dev>"
+copyright = "2024, Tomek Sroka"
+license-file = ["LICENSE-MIT", "4"]
+extended-description = """\
+k8stun creates a transparent network tunnel that connects your local machine \
+directly to a Kubernetes cluster. Access internal Kubernetes services \
+(like http://my-service.default) from your local browser or terminal \
+as if your laptop were physically inside the cluster network."""
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/k8stun", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/k8stun/README", "644"],
+]
