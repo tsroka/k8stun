@@ -8,10 +8,11 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::collections::{BinaryHeap, HashMap};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -218,9 +219,45 @@ pub struct VipStatsSnapshot {
     pub bytes_received: u64,
 }
 
+/// Information about an active connection to a VIP.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionInfo {
+    /// When the connection was created (RFC3339 format).
+    pub created_at: DateTime<Utc>,
+    /// Source IP address (who initiated the connection).
+    pub src_ip: Ipv4Addr,
+    /// Source port.
+    pub src_port: u16,
+    /// Destination port.
+    pub dst_port: u16,
+}
+
+/// Detailed information about a VIP allocation.
+#[derive(Debug, Clone, Serialize)]
+pub struct VipAllocation {
+    /// The virtual IP address.
+    pub vip: Ipv4Addr,
+    /// The target (service or pod) this VIP maps to.
+    pub target: TargetId,
+    /// When this VIP was allocated (RFC3339 format).
+    pub allocated_at: DateTime<Utc>,
+    /// Current statistics for this VIP.
+    pub stats: VipStatsSnapshot,
+    /// Currently active connections to this VIP.
+    pub connections: Vec<ConnectionInfo>,
+}
+
 // ============================================================================
 // VIP Update Events (for real-time notifications)
 // ============================================================================
+
+/// Type of connection event.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionEventType {
+    Connected,
+    Disconnected,
+}
 
 /// Represents a state change in the VIP manager.
 /// These events are broadcast to subscribers for real-time updates.
@@ -228,18 +265,14 @@ pub struct VipStatsSnapshot {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum VipUpdate {
     /// A new VIP was allocated for a target.
-    VipAllocated {
-        vip: Ipv4Addr,
-        target: TargetId,
-    },
+    VipAllocated { vip: Ipv4Addr, target: TargetId },
     /// A VIP was removed (due to stale cleanup).
-    VipRemoved {
-        vip: Ipv4Addr,
-        target: TargetId,
-    },
+    VipRemoved { vip: Ipv4Addr, target: TargetId },
     /// Connection count changed for a VIP.
     ConnectionChanged {
         vip: Ipv4Addr,
+        event_type: ConnectionEventType,
+        connection: ConnectionInfo,
         active_connections: u32,
         total_connections: u64,
     },
@@ -323,6 +356,8 @@ enum VipMessage {
     // Connection registration (request/response - returns Arc<VipStats> for the guard)
     RegisterConnection {
         vip: Ipv4Addr,
+        src_addr: SocketAddr,
+        dst_port: u16,
         response: oneshot::Sender<Option<(ConnectionId, Arc<VipStats>)>>,
     },
 
@@ -341,7 +376,7 @@ enum VipMessage {
         response: oneshot::Sender<Vec<(Ipv4Addr, ServiceId)>>,
     },
     GetAllTargetMappings {
-        response: oneshot::Sender<Vec<(Ipv4Addr, TargetId, VipStatsSnapshot)>>,
+        response: oneshot::Sender<Vec<VipAllocation>>,
     },
 }
 
@@ -349,10 +384,19 @@ enum VipMessage {
 // Actor Internal State
 // ============================================================================
 
+/// Internal tracking data for an active connection.
+struct ConnectionEntry {
+    created_at: DateTime<Utc>,
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+}
+
 /// Per-VIP allocation entry.
 struct VipEntry {
     target: TargetId,
-    active_connections: HashSet<ConnectionId>,
+    active_connections: HashMap<ConnectionId, ConnectionEntry>,
+    allocated_at: DateTime<Utc>,
     last_activity: Instant,
     stats: Arc<VipStats>,
 }
@@ -449,8 +493,13 @@ impl VipManagerActor {
                 let _ = response.send(target);
             }
 
-            VipMessage::RegisterConnection { vip, response } => {
-                let result = self.register_connection(vip);
+            VipMessage::RegisterConnection {
+                vip,
+                src_addr,
+                dst_port,
+                response,
+            } => {
+                let result = self.register_connection(vip, src_addr, dst_port);
                 let _ = response.send(result);
             }
 
@@ -482,7 +531,25 @@ impl VipManagerActor {
                 let mappings = self
                     .vip_entries
                     .iter()
-                    .map(|(vip, entry)| (*vip, entry.target.clone(), entry.stats.snapshot()))
+                    .map(|(vip, entry)| {
+                        let connections = entry
+                            .active_connections
+                            .values()
+                            .map(|conn| ConnectionInfo {
+                                created_at: conn.created_at,
+                                src_ip: conn.src_ip,
+                                src_port: conn.src_port,
+                                dst_port: conn.dst_port,
+                            })
+                            .collect();
+                        VipAllocation {
+                            vip: *vip,
+                            target: entry.target.clone(),
+                            allocated_at: entry.allocated_at,
+                            stats: entry.stats.snapshot(),
+                            connections,
+                        }
+                    })
                     .collect();
                 let _ = response.send(mappings);
             }
@@ -516,7 +583,8 @@ impl VipManagerActor {
             vip,
             VipEntry {
                 target: target.clone(),
-                active_connections: HashSet::new(),
+                active_connections: HashMap::new(),
+                allocated_at: Utc::now(),
                 last_activity: now,
                 stats,
             },
@@ -557,11 +625,23 @@ impl VipManagerActor {
         Ok(vip)
     }
 
-    fn register_connection(&mut self, vip: Ipv4Addr) -> Option<(ConnectionId, Arc<VipStats>)> {
+    fn register_connection(
+        &mut self,
+        vip: Ipv4Addr,
+        src_addr: SocketAddr,
+        dst_port: u16,
+    ) -> Option<(ConnectionId, Arc<VipStats>)> {
         let conn_id = ConnectionId::new(self.next_conn_id);
         self.next_conn_id += 1;
 
+        // Extract IPv4 address from SocketAddr
+        let src_ip = match src_addr {
+            SocketAddr::V4(addr) => *addr.ip(),
+            SocketAddr::V6(_) => return None, // IPv6 not supported
+        };
+
         let now = Instant::now();
+        let created_at = Utc::now();
         let (stats, active, total) = {
             let entry = self.vip_entries.get_mut(&vip)?;
 
@@ -577,8 +657,14 @@ impl VipManagerActor {
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
 
-            // Track connection
-            entry.active_connections.insert(conn_id.clone());
+            // Track connection with metadata
+            let conn_entry = ConnectionEntry {
+                created_at,
+                src_ip,
+                src_port: src_addr.port(),
+                dst_port,
+            };
+            entry.active_connections.insert(conn_id.clone(), conn_entry);
             entry.last_activity = now;
 
             (Arc::clone(&entry.stats), active, total)
@@ -590,9 +676,17 @@ impl VipManagerActor {
             vip,
         });
 
-        // Broadcast the connection change
+        // Broadcast the connection change with details
+        let connection = ConnectionInfo {
+            created_at,
+            src_ip,
+            src_port: src_addr.port(),
+            dst_port,
+        };
         let _ = self.update_tx.send(VipUpdate::ConnectionChanged {
             vip,
+            event_type: ConnectionEventType::Connected,
+            connection,
             active_connections: active,
             total_connections: total,
         });
@@ -604,28 +698,40 @@ impl VipManagerActor {
 
     fn handle_connection_closed(&mut self, vip: Ipv4Addr, conn_id: ConnectionId) {
         let now = Instant::now();
-        let connection_info = {
+        let connection_data = {
             if let Some(entry) = self.vip_entries.get_mut(&vip) {
-                entry.active_connections.remove(&conn_id);
+                // Get connection info before removing
+                let conn_info =
+                    entry
+                        .active_connections
+                        .remove(&conn_id)
+                        .map(|conn| ConnectionInfo {
+                            created_at: conn.created_at,
+                            src_ip: conn.src_ip,
+                            src_port: conn.src_port,
+                            dst_port: conn.dst_port,
+                        });
                 entry.last_activity = now;
                 let active = entry.stats.active_connections.load(Ordering::Relaxed);
                 let total = entry.stats.total_connections.load(Ordering::Relaxed);
-                Some((entry.active_connections.len(), active, total))
+                conn_info.map(|info| (entry.active_connections.len(), active, total, info))
             } else {
                 None
             }
         };
 
-        if let Some((count, active, total)) = connection_info {
+        if let Some((count, active, total, connection)) = connection_data {
             // Push to heap after releasing borrow
             self.stale_heap.push(HeapEntry {
                 last_activity: Reverse(now),
                 vip,
             });
 
-            // Broadcast the connection change
+            // Broadcast the connection change with details
             let _ = self.update_tx.send(VipUpdate::ConnectionChanged {
                 vip,
+                event_type: ConnectionEventType::Disconnected,
+                connection,
                 active_connections: active,
                 total_connections: total,
             });
@@ -857,10 +963,25 @@ impl VipManager {
     ///
     /// Returns an `ActiveConnection` guard that automatically unregisters
     /// when dropped. The guard provides methods to update byte counters.
-    pub async fn register_connection(&self, vip: Ipv4Addr) -> Option<ActiveConnection> {
+    ///
+    /// # Arguments
+    /// * `vip` - The VIP address being connected to
+    /// * `src_addr` - The source address of the connection (for tracking)
+    /// * `dst_port` - The destination port of the connection
+    pub async fn register_connection(
+        &self,
+        vip: Ipv4Addr,
+        src_addr: SocketAddr,
+        dst_port: u16,
+    ) -> Option<ActiveConnection> {
         let (tx, rx) = oneshot::channel();
         self.sender
-            .send(VipMessage::RegisterConnection { vip, response: tx })
+            .send(VipMessage::RegisterConnection {
+                vip,
+                src_addr,
+                dst_port,
+                response: tx,
+            })
             .await
             .ok()?;
 
@@ -895,8 +1016,8 @@ impl VipManager {
         rx.await.unwrap_or_default()
     }
 
-    /// Returns all currently allocated VIP mappings with stats.
-    pub async fn get_all_target_mappings(&self) -> Vec<(Ipv4Addr, TargetId, VipStatsSnapshot)> {
+    /// Returns all currently allocated VIP mappings with detailed info.
+    pub async fn get_all_target_mappings(&self) -> Vec<VipAllocation> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -1088,13 +1209,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_tracking() {
+        use std::net::SocketAddrV4;
+
         let manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
 
         let svc = ServiceId::new("test-svc", "default");
         let vip = manager.get_or_allocate_vip(svc).await.unwrap();
 
+        // Create test source addresses
+        let src1 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345));
+        let src2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 101), 12346));
+        let dst_port = 8080;
+
         // Register a connection
-        let conn = manager.register_connection(vip).await.unwrap();
+        let conn = manager
+            .register_connection(vip, src1, dst_port)
+            .await
+            .unwrap();
 
         // Check stats
         let stats = manager.get_stats(vip).await.unwrap();
@@ -1111,7 +1242,10 @@ mod tests {
         assert_eq!(stats.bytes_received, 200);
 
         // Register another connection
-        let conn2 = manager.register_connection(vip).await.unwrap();
+        let conn2 = manager
+            .register_connection(vip, src2, dst_port)
+            .await
+            .unwrap();
         let stats = manager.get_stats(vip).await.unwrap();
         assert_eq!(stats.active_connections, 2);
         assert_eq!(stats.total_connections, 2);

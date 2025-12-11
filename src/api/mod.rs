@@ -3,6 +3,7 @@
 //! This module provides a REST API and Server-Sent Events (SSE) endpoint
 //! for querying and monitoring VIP allocations in real-time.
 
+mod dashboard;
 mod handlers;
 mod types;
 
@@ -23,6 +24,7 @@ use crate::vip::VipManager;
 /// A future that runs the server until shutdown.
 pub async fn start_server(port: u16, vip_manager: VipManager) -> anyhow::Result<()> {
     let app = Router::new()
+        .route("/", get(dashboard::dashboard))
         .route("/vips", get(handlers::get_vips))
         .route("/events", get(handlers::events))
         .with_state(vip_manager);
@@ -36,4 +38,3 @@ pub async fn start_server(port: u16, vip_manager: VipManager) -> anyhow::Result<
 
     Ok(())
 }
-

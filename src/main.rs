@@ -339,8 +339,14 @@ async fn main() -> Result<()> {
     if args.http > 0 {
         info!("");
         info!("API server available at:");
-        info!("  GET  http://localhost:{}/vips    - Current VIP mappings", args.http);
-        info!("  GET  http://localhost:{}/events  - Real-time updates (SSE)", args.http);
+        info!(
+            "  GET  http://localhost:{}/vips    - Current VIP mappings",
+            args.http
+        );
+        info!(
+            "  GET  http://localhost:{}/events  - Real-time updates (SSE)",
+            args.http
+        );
     }
 
     info!("");
@@ -360,6 +366,7 @@ async fn main() -> Result<()> {
                 let stream = connection.stream;
                 let vip = connection.vip;
                 let port = connection.port;
+                let src_addr = stream.local_addr;
                 let k8s = Arc::clone(&k8s_client);
                 let vip_mgr = vip_manager.clone();
 
@@ -372,7 +379,7 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     // Register the connection with VipManager to track it
                     // The guard will automatically unregister when dropped
-                    let _active_conn = match vip_mgr.register_connection(vip).await {
+                    let _active_conn = match vip_mgr.register_connection(vip, src_addr, port).await {
                         Some(guard) => guard,
                         None => {
                             error!("Failed to register connection for VIP {}", vip);

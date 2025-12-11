@@ -12,20 +12,13 @@ use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 
 use crate::vip::VipManager;
 
-use super::types::{TargetInfo, VipEvent, VipInfo, VipSnapshot};
+use super::types::{VipEvent, VipInfo, VipSnapshot};
 
 /// GET /vips - Returns current VIP mappings as JSON.
 pub async fn get_vips(State(vip_manager): State<VipManager>) -> Json<VipSnapshot> {
     let mappings = vip_manager.get_all_target_mappings().await;
 
-    let vips = mappings
-        .into_iter()
-        .map(|(vip, target, stats)| VipInfo {
-            vip,
-            target: TargetInfo::from(&target),
-            stats,
-        })
-        .collect();
+    let vips = mappings.into_iter().map(VipInfo::from).collect();
 
     Json(VipSnapshot { vips })
 }
@@ -38,14 +31,7 @@ pub async fn events(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Get initial snapshot
     let mappings = vip_manager.get_all_target_mappings().await;
-    let initial_vips: Vec<VipInfo> = mappings
-        .into_iter()
-        .map(|(vip, target, stats)| VipInfo {
-            vip,
-            target: TargetInfo::from(&target),
-            stats,
-        })
-        .collect();
+    let initial_vips: Vec<VipInfo> = mappings.into_iter().map(VipInfo::from).collect();
 
     let snapshot_event = VipEvent::Snapshot { vips: initial_vips };
 
@@ -61,13 +47,13 @@ pub async fn events(
 
     // Create initial snapshot event
     let snapshot_data = serde_json::to_string(&snapshot_event).unwrap_or_default();
-    let initial_event = futures::stream::once(async move {
-        Ok::<_, Infallible>(Event::default().data(snapshot_data))
-    });
+    let initial_event =
+        futures::stream::once(
+            async move { Ok::<_, Infallible>(Event::default().data(snapshot_data)) },
+        );
 
     // Combine initial snapshot with update stream
     let combined_stream = initial_event.chain(update_stream);
 
     Sse::new(combined_stream).keep_alive(KeepAlive::default())
 }
-

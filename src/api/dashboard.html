@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>k8stun - VIP Dashboard</title>
+  <style>
+    :root {
+      --bg-primary: #0d1117;
+      --bg-secondary: #161b22;
+      --bg-tertiary: #21262d;
+      --border: #30363d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --text-muted: #6e7681;
+      --accent-cyan: #58a6ff;
+      --accent-green: #3fb950;
+      --accent-orange: #d29922;
+      --accent-red: #f85149;
+      --accent-purple: #a371f7;
+      --highlight: rgba(88, 166, 255, 0.25);
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 32px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-icon {
+      width: 40px;
+      height: 40px;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 0.875rem;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    .status-dot.disconnected {
+      background: var(--accent-red);
+      animation: none;
+    }
+
+    .status-dot.connecting {
+      background: var(--accent-orange);
+      animation: pulse 0.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .stats-bar {
+      display: flex;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      min-width: 140px;
+    }
+
+    .stat-label {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+
+    .stat-value {
+      font-size: 1.75rem;
+      font-weight: 600;
+      color: var(--accent-cyan);
+    }
+
+    .table-container {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+
+    thead {
+      background: var(--bg-tertiary);
+    }
+
+    th {
+      text-align: left;
+      padding: 12px 16px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+
+    tbody tr:hover {
+      background: var(--bg-tertiary);
+    }
+
+    tbody tr:last-child {
+      border-bottom: none;
+    }
+
+    td {
+      padding: 12px 16px;
+      vertical-align: middle;
+    }
+
+    .vip-cell {
+      font-weight: 600;
+      color: var(--accent-cyan);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .expand-icon {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      transition: transform 0.2s ease;
+    }
+
+    tr.expanded .expand-icon {
+      transform: rotate(90deg);
+    }
+
+    .type-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      text-transform: uppercase;
+    }
+
+    .type-service {
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--accent-green);
+    }
+
+    .type-pod {
+      background: rgba(163, 113, 247, 0.15);
+      color: var(--accent-purple);
+    }
+
+    .connection-count {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .connection-count.active {
+      color: var(--accent-green);
+    }
+
+    .connection-count.inactive {
+      color: var(--text-muted);
+    }
+
+    .bytes-cell {
+      font-variant-numeric: tabular-nums;
+      color: var(--text-secondary);
+    }
+
+    .time-cell {
+      color: var(--text-muted);
+      font-size: 0.8125rem;
+    }
+
+    .time-value {
+      cursor: help;
+      border-bottom: 1px dotted var(--text-muted);
+    }
+
+    .time-value:hover {
+      color: var(--text-secondary);
+    }
+
+    /* Expandable connection rows */
+    .connection-row {
+      display: none;
+      background: var(--bg-primary);
+    }
+
+    .connection-row.expanded {
+      display: table-row;
+    }
+
+    .connection-row td {
+      padding: 0;
+    }
+
+    .connections-wrapper {
+      padding: 12px 16px 12px 48px;
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.3s ease, padding 0.3s ease;
+    }
+
+    .connection-row.expanded .connections-wrapper {
+      max-height: 400px;
+      padding: 16px 16px 16px 48px;
+    }
+
+    .connections-table {
+      width: 100%;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+
+    .connections-table th {
+      background: var(--bg-tertiary);
+      padding: 8px 12px;
+      font-size: 0.6875rem;
+    }
+
+    .connections-table td {
+      padding: 8px 12px;
+      font-size: 0.8125rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .connections-table tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    .connections-table tbody tr {
+      cursor: default;
+    }
+
+    .no-connections {
+      color: var(--text-muted);
+      font-style: italic;
+      padding: 12px;
+      text-align: center;
+    }
+
+    /* Highlight animation */
+    @keyframes flash {
+      0% { background: var(--highlight); }
+      100% { background: transparent; }
+    }
+
+    .highlight {
+      animation: flash 1.5s ease-out;
+    }
+
+    /* Row enter animation */
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(-10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .row-enter {
+      animation: slideIn 0.3s ease-out;
+    }
+
+    /* Row exit animation */
+    @keyframes fadeOut {
+      from {
+        opacity: 1;
+        background: rgba(248, 81, 73, 0.15);
+      }
+      to {
+        opacity: 0;
+        background: rgba(248, 81, 73, 0.15);
+      }
+    }
+
+    .row-exit {
+      animation: fadeOut 0.4s ease-out forwards;
+    }
+
+    /* Toolbar */
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    .filter-toggle {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .filter-toggle input {
+      display: none;
+    }
+
+    .toggle-track {
+      width: 36px;
+      height: 20px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      position: relative;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+
+    .toggle-track::after {
+      content: '';
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      background: var(--text-muted);
+      border-radius: 50%;
+      top: 2px;
+      left: 2px;
+      transition: transform 0.2s ease, background 0.2s ease;
+    }
+
+    .filter-toggle input:checked + .toggle-track {
+      background: rgba(88, 166, 255, 0.2);
+      border-color: var(--accent-cyan);
+    }
+
+    .filter-toggle input:checked + .toggle-track::after {
+      transform: translateX(16px);
+      background: var(--accent-cyan);
+    }
+
+    .toggle-label {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+
+    .filter-toggle:hover .toggle-label {
+      color: var(--text-primary);
+    }
+
+    .visible-count {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+    }
+
+    /* Hidden rows */
+    .vip-row.hidden-inactive {
+      display: none;
+    }
+
+    .vip-row.hidden-inactive + .connection-row {
+      display: none !important;
+    }
+
+    /* Empty state */
+    .empty-state {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--text-muted);
+    }
+
+    .empty-state-icon {
+      font-size: 3rem;
+      margin-bottom: 16px;
+      opacity: 0.5;
+    }
+
+    .empty-state-text {
+      font-size: 1rem;
+    }
+
+    /* Responsive */
+    @media (max-width: 1024px) {
+      .table-container {
+        overflow-x: auto;
+      }
+      
+      table {
+        min-width: 900px;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .stats-bar {
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+      
+      .stat-card {
+        flex: 1;
+        min-width: 100px;
+      }
+      
+      header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo">
+        <div class="logo-icon">⚡</div>
+        <h1>k8stun</h1>
+      </div>
+      <div class="status-badge">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Connecting...</span>
+      </div>
+    </header>
+
+    <div class="stats-bar">
+      <div class="stat-card">
+        <div class="stat-label">VIPs</div>
+        <div class="stat-value" id="totalVips">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Active Connections</div>
+        <div class="stat-value" id="totalConnections">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Bytes Sent</div>
+        <div class="stat-value" id="totalBytesSent">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Bytes Received</div>
+        <div class="stat-value" id="totalBytesReceived">0</div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <label class="filter-toggle">
+        <input type="checkbox" id="hideInactive">
+        <span class="toggle-track"></span>
+        <span class="toggle-label">Hide inactive VIPs</span>
+      </label>
+      <span class="visible-count" id="visibleCount"></span>
+    </div>
+
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>VIP</th>
+            <th>Type</th>
+            <th>Namespace</th>
+            <th>Name</th>
+            <th>Active</th>
+            <th>Total</th>
+            <th>Bytes Sent</th>
+            <th>Bytes Received</th>
+            <th>Allocated</th>
+          </tr>
+        </thead>
+        <tbody id="vipTableBody">
+        </tbody>
+      </table>
+      <div class="empty-state" id="emptyState">
+        <div class="empty-state-icon">🔌</div>
+        <div class="empty-state-text">No VIP allocations yet</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // State management
+    const vipData = new Map();
+    let eventSource = null;
+    let reconnectTimeout = null;
+    let hideInactive = false;
+
+    // DOM elements
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const vipTableBody = document.getElementById('vipTableBody');
+    const emptyState = document.getElementById('emptyState');
+    const totalVipsEl = document.getElementById('totalVips');
+    const totalConnectionsEl = document.getElementById('totalConnections');
+    const totalBytesSentEl = document.getElementById('totalBytesSent');
+    const totalBytesReceivedEl = document.getElementById('totalBytesReceived');
+    const hideInactiveToggle = document.getElementById('hideInactive');
+    const visibleCountEl = document.getElementById('visibleCount');
+
+    // Utility functions
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    function formatFullTime(dateString) {
+      const date = new Date(dateString);
+      return date.toLocaleString();
+    }
+
+    function timeAgo(dateString) {
+      const date = new Date(dateString);
+      const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+      
+      if (seconds < 0) return 'just now';
+      if (seconds < 60) return `${seconds}s ago`;
+      if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+      if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+      return `${Math.floor(seconds / 86400)}d ago`;
+    }
+
+    function timeWithTooltip(dateString) {
+      const relative = timeAgo(dateString);
+      const full = formatFullTime(dateString);
+      return `<span class="time-value" title="${full}" data-time="${dateString}">${relative}</span>`;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Apply filter to show/hide inactive VIPs
+    function applyFilter() {
+      let visibleCount = 0;
+      let totalCount = vipData.size;
+
+      // Iterate through vipData to ensure we check all VIPs
+      vipData.forEach((vip, vipAddr) => {
+        const escapedVip = CSS.escape(vipAddr);
+        const row = document.querySelector(`tr.vip-row[data-vip="${escapedVip}"]`);
+        if (!row) return;
+
+        if (hideInactive && vip.stats.active_connections === 0) {
+          row.classList.add('hidden-inactive');
+        } else {
+          row.classList.remove('hidden-inactive');
+          visibleCount++;
+        }
+      });
+
+      // Update visible count indicator
+      if (hideInactive && visibleCount < totalCount) {
+        visibleCountEl.textContent = `Showing ${visibleCount} of ${totalCount}`;
+      } else {
+        visibleCountEl.textContent = '';
+      }
+
+      // Update empty state based on visible rows
+      const hasVisibleRows = visibleCount > 0;
+      emptyState.style.display = hasVisibleRows ? 'none' : 'block';
+      if (!hasVisibleRows && totalCount > 0) {
+        emptyState.querySelector('.empty-state-text').textContent = 'No VIPs with active connections';
+      } else if (totalCount === 0) {
+        emptyState.querySelector('.empty-state-text').textContent = 'No VIP allocations yet';
+      }
+    }
+
+    // Update stats bar
+    function updateStats() {
+      let totalConns = 0;
+      let totalSent = 0;
+      let totalReceived = 0;
+
+      vipData.forEach(vip => {
+        totalConns += vip.stats.active_connections;
+        totalSent += vip.stats.bytes_sent;
+        totalReceived += vip.stats.bytes_received;
+      });
+
+      totalVipsEl.textContent = vipData.size;
+      totalConnectionsEl.textContent = totalConns;
+      totalBytesSentEl.textContent = formatBytes(totalSent);
+      totalBytesReceivedEl.textContent = formatBytes(totalReceived);
+
+      applyFilter();
+    }
+
+    // Highlight cell
+    function highlightCell(cell) {
+      cell.classList.remove('highlight');
+      void cell.offsetWidth; // Trigger reflow
+      cell.classList.add('highlight');
+    }
+
+    // Render connections sub-table
+    function renderConnectionsTable(connections) {
+      if (!connections || connections.length === 0) {
+        return '<div class="no-connections">No active connections</div>';
+      }
+
+      const rows = connections.map(c => `
+        <tr>
+          <td>${escapeHtml(c.src_ip)}</td>
+          <td>${c.src_port}</td>
+          <td>${c.dst_port}</td>
+          <td>${timeWithTooltip(c.created_at)}</td>
+        </tr>
+      `).join('');
+
+      return `
+        <table class="connections-table">
+          <thead>
+            <tr>
+              <th>Source IP</th>
+              <th>Source Port</th>
+              <th>Dest Port</th>
+              <th>Connected</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    // Create VIP row HTML
+    function createVipRowHtml(vip) {
+      const isService = vip.target.type === 'service';
+      const typeClass = isService ? 'type-service' : 'type-pod';
+      const typeName = isService ? 'SVC' : 'POD';
+      const connClass = vip.stats.active_connections > 0 ? 'active' : 'inactive';
+
+      return `
+        <tr class="vip-row row-enter" data-vip="${vip.vip}" onclick="toggleRow('${vip.vip}')">
+          <td>
+            <div class="vip-cell">
+              <span class="expand-icon">▶</span>
+              ${escapeHtml(vip.vip)}
+            </div>
+          </td>
+          <td><span class="type-badge ${typeClass}">${typeName}</span></td>
+          <td>${escapeHtml(vip.target.namespace)}</td>
+          <td>${escapeHtml(vip.target.name)}</td>
+          <td class="active-conn"><span class="connection-count ${connClass}">${vip.stats.active_connections}</span></td>
+          <td class="total-conn">${vip.stats.total_connections}</td>
+          <td class="bytes-cell bytes-sent">${formatBytes(vip.stats.bytes_sent)}</td>
+          <td class="bytes-cell bytes-recv">${formatBytes(vip.stats.bytes_received)}</td>
+          <td class="time-cell">${timeWithTooltip(vip.allocated_at)}</td>
+        </tr>
+        <tr class="connection-row" id="connections-${vip.vip}">
+          <td colspan="9">
+            <div class="connections-wrapper">
+              ${renderConnectionsTable(vip.connections)}
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+
+    // Toggle expandable row
+    window.toggleRow = function(vipAddr) {
+      const escapedVip = CSS.escape(vipAddr);
+      const mainRow = document.querySelector(`tr[data-vip="${escapedVip}"]`);
+      const connRow = document.getElementById(`connections-${vipAddr}`);
+      
+      if (mainRow && connRow) {
+        mainRow.classList.toggle('expanded');
+        connRow.classList.toggle('expanded');
+      }
+    };
+
+    // Initialize table from snapshot
+    function initTable(vips) {
+      vipData.clear();
+      vipTableBody.innerHTML = '';
+
+      vips.forEach(vip => {
+        vipData.set(vip.vip, vip);
+      });
+
+      const html = vips.map(createVipRowHtml).join('');
+      vipTableBody.innerHTML = html;
+
+      // Remove enter animation class after animation completes
+      setTimeout(() => {
+        document.querySelectorAll('.row-enter').forEach(el => {
+          el.classList.remove('row-enter');
+        });
+      }, 300);
+
+      updateStats();
+    }
+
+    // Add new VIP row
+    function addRow(event) {
+      const vip = {
+        vip: event.vip,
+        target: event.target,
+        allocated_at: new Date().toISOString(),
+        stats: { active_connections: 0, total_connections: 0, bytes_sent: 0, bytes_received: 0 },
+        connections: []
+      };
+
+      vipData.set(vip.vip, vip);
+
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = createVipRowHtml(vip);
+      
+      const mainRow = tempDiv.querySelector('.vip-row');
+      const connRow = tempDiv.querySelector('.connection-row');
+      
+      vipTableBody.appendChild(mainRow);
+      vipTableBody.appendChild(connRow);
+
+      // Highlight entire row
+      mainRow.querySelectorAll('td').forEach(highlightCell);
+
+      setTimeout(() => mainRow.classList.remove('row-enter'), 300);
+
+      updateStats();
+    }
+
+    // Remove VIP row
+    function removeRow(vipAddr) {
+      vipData.delete(vipAddr);
+
+      const escapedVip = CSS.escape(vipAddr);
+      const mainRow = document.querySelector(`tr[data-vip="${escapedVip}"]`);
+      const connRow = document.getElementById(`connections-${vipAddr}`);
+
+      if (mainRow) {
+        mainRow.classList.add('row-exit');
+        setTimeout(() => {
+          mainRow.remove();
+          if (connRow) connRow.remove();
+          updateStats();
+        }, 400);
+      } else {
+        // Row doesn't exist in DOM, just update stats
+        updateStats();
+      }
+    }
+
+    // Update connection counts
+    function updateConnections(event) {
+      let vip = vipData.get(event.vip);
+      
+      // If VIP not in our data yet, create a placeholder entry
+      // This handles race conditions where connection event arrives before allocation event
+      if (!vip) {
+        console.warn(`Connection event for unknown VIP ${event.vip}, creating placeholder`);
+        vip = {
+          vip: event.vip,
+          target: { type: 'unknown', name: 'unknown', namespace: 'unknown' },
+          allocated_at: new Date().toISOString(),
+          stats: { active_connections: 0, total_connections: 0, bytes_sent: 0, bytes_received: 0 },
+          connections: []
+        };
+        vipData.set(event.vip, vip);
+      }
+
+      // Update stats
+      vip.stats.active_connections = event.active_connections;
+      vip.stats.total_connections = event.total_connections;
+
+      // Update connections list
+      // Note: event_type is serialized as snake_case by Rust serde
+      if (event.event_type === 'connected') {
+        vip.connections.push(event.connection);
+      } else if (event.event_type === 'disconnected') {
+        vip.connections = vip.connections.filter(c => 
+          !(c.src_ip === event.connection.src_ip && 
+            c.src_port === event.connection.src_port && 
+            c.dst_port === event.connection.dst_port)
+        );
+      }
+
+      // Update DOM - use escaped selector for VIP addresses
+      const escapedVip = CSS.escape(event.vip);
+      const mainRow = document.querySelector(`tr[data-vip="${escapedVip}"]`);
+      if (mainRow) {
+        const activeCell = mainRow.querySelector('.active-conn');
+        const totalCell = mainRow.querySelector('.total-conn');
+        
+        if (activeCell) {
+          const connClass = event.active_connections > 0 ? 'active' : 'inactive';
+          activeCell.innerHTML = `<span class="connection-count ${connClass}">${event.active_connections}</span>`;
+          highlightCell(activeCell);
+        }
+        
+        if (totalCell) {
+          totalCell.textContent = event.total_connections;
+          highlightCell(totalCell);
+        }
+      }
+
+      // Update connections sub-table - use escaped ID
+      const connRow = document.getElementById(`connections-${event.vip}`);
+      if (connRow) {
+        const wrapper = connRow.querySelector('.connections-wrapper');
+        if (wrapper) {
+          wrapper.innerHTML = renderConnectionsTable(vip.connections);
+        }
+      }
+
+      updateStats();
+    }
+
+    // Connection status management
+    function setStatus(status) {
+      statusDot.className = 'status-dot';
+      
+      switch (status) {
+        case 'connected':
+          statusText.textContent = 'Connected';
+          break;
+        case 'connecting':
+          statusDot.classList.add('connecting');
+          statusText.textContent = 'Connecting...';
+          break;
+        case 'disconnected':
+          statusDot.classList.add('disconnected');
+          statusText.textContent = 'Disconnected';
+          break;
+      }
+    }
+
+    // Connect to SSE endpoint
+    function connect() {
+      if (eventSource) {
+        eventSource.close();
+      }
+
+      setStatus('connecting');
+      eventSource = new EventSource('/events');
+
+      eventSource.onopen = () => {
+        setStatus('connected');
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+          reconnectTimeout = null;
+        }
+      };
+
+      eventSource.onmessage = (e) => {
+        let event;
+        try {
+          event = JSON.parse(e.data);
+        } catch (err) {
+          console.error('Failed to parse event:', err, e.data);
+          return;
+        }
+        
+        try {
+          switch (event.type) {
+            case 'snapshot':
+              initTable(event.vips);
+              break;
+            case 'vip_allocated':
+              addRow(event);
+              break;
+            case 'vip_removed':
+              removeRow(event.vip);
+              break;
+            case 'connection_changed':
+              updateConnections(event);
+              break;
+            default:
+              console.warn('Unknown event type:', event.type);
+          }
+        } catch (err) {
+          console.error('Error processing event:', err, event);
+        }
+      };
+
+      eventSource.onerror = () => {
+        setStatus('disconnected');
+        eventSource.close();
+        
+        // Reconnect after delay
+        reconnectTimeout = setTimeout(connect, 3000);
+      };
+    }
+
+    // Update relative times periodically (every 10 seconds)
+    setInterval(() => {
+      // Update all time-value elements using their data-time attribute
+      document.querySelectorAll('.time-value').forEach(el => {
+        const dateString = el.dataset.time;
+        if (dateString) {
+          el.textContent = timeAgo(dateString);
+        }
+      });
+    }, 10000);
+
+    // Toggle filter handler
+    hideInactiveToggle.addEventListener('change', (e) => {
+      hideInactive = e.target.checked;
+      applyFilter();
+    });
+
+    // Initialize
+    connect();
+  </script>
+</body>
+</html>
+
