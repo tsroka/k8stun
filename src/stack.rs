@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use tun2::AsyncDevice;
 
+use crate::dns::build_servfail_response;
 use crate::dns_resolver::DnsResolver;
 use crate::vip::{TargetId, VipManager};
 
@@ -272,17 +273,33 @@ async fn run_udp_handler(udp_socket: Box<UdpSocket>, dns_resolver: Arc<DnsResolv
         if dst_addr.port() == 53 {
             // Use the DnsResolver to handle the query
             match dns_resolver.resolve(&payload).await {
-                Ok(Some(response)) => {
-                    // Send response back: swap src and dst addresses
-                    if let Err(e) = udp_writer.send_to(&response, &dst_addr, &src_addr) {
-                        debug!("Failed to send DNS response: {}", e);
+                Ok(response) => {
+                    // Serialize and send response back: swap src and dst addresses
+                    match response.to_vec() {
+                        Ok(bytes) => {
+                            if let Err(e) = udp_writer.send_to(&bytes, &dst_addr, &src_addr) {
+                                debug!("Failed to send DNS response: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to serialize DNS response: {}", e);
+                        }
                     }
-                }
-                Ok(None) => {
-                    // No response needed
                 }
                 Err(e) => {
                     debug!("DNS handling error: {}", e);
+                    // Send SERVFAIL response so client doesn't hang
+                    let response = build_servfail_response(&payload);
+                    match response.to_vec() {
+                        Ok(bytes) => {
+                            if let Err(e) = udp_writer.send_to(&bytes, &dst_addr, &src_addr) {
+                                debug!("Failed to send SERVFAIL response: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to serialize SERVFAIL response: {}", e);
+                        }
+                    }
                 }
             }
         }

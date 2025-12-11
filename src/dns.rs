@@ -4,11 +4,10 @@
 //! and returning virtual IP addresses as responses.
 
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use hickory_proto::op::{Header, Message, MessageType, ResponseCode};
-use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use tracing::debug;
 
 use crate::k8s::NamespaceSet;
@@ -53,13 +52,18 @@ impl DnsQuery {
             .collect()
     }
 
-    /// Builds a DNS response with the given IP address.
-    pub fn build_response(&self, ip: Ipv4Addr) -> Bytes {
+    /// Builds a DNS response with the given IP address (for K8s VIP responses).
+    pub fn build_response(&self, ip: Ipv4Addr) -> Message {
+        self.build_response_with_ips(std::iter::once(IpAddr::V4(ip)))
+    }
+
+    /// Builds a DNS response with all given IP addresses.
+    pub fn build_response_with_ips(&self, ips: impl Iterator<Item = IpAddr>) -> Message {
         let mut response = Message::new();
 
         // Set up the response header
         let mut header = Header::response_from_request(self.message.header());
-        header.set_authoritative(true);
+        header.set_authoritative(false); // Not authoritative for forwarded responses
         header.set_recursion_available(true);
         header.set_response_code(ResponseCode::NoError);
         response.set_header(header);
@@ -69,65 +73,207 @@ impl DnsQuery {
             response.add_query(query.clone());
         }
 
-        // Add the answer record for the first A record question
-        if let Some(query) = self
+        // Find the query name for the answer records
+        let query_name = self
             .message
             .queries()
             .iter()
-            .find(|q| q.query_type() == RecordType::A)
-        {
-            let mut record = Record::from_rdata(query.name().clone(), 60, RData::A(A(ip)));
-            record.set_dns_class(DNSClass::IN);
-            response.add_answer(record);
+            .find(|q| q.query_type() == RecordType::A || q.query_type() == RecordType::AAAA)
+            .map(|q| q.name().clone());
+
+        if let Some(name) = query_name {
+            let mut count = 0;
+            for ip in ips {
+                let rdata = match ip {
+                    IpAddr::V4(v4) => RData::A(A(v4)),
+                    IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
+                };
+                let mut record = Record::from_rdata(name.clone(), 60, rdata);
+                record.set_dns_class(DNSClass::IN);
+                response.add_answer(record);
+                count += 1;
+            }
+
+            debug!(
+                "Built DNS response for {} with {} address(es)",
+                self.questions()
+                    .first()
+                    .map(|q| q.name.as_str())
+                    .unwrap_or("?"),
+                count
+            );
         }
 
-        let response_bytes = response.to_vec().expect("Failed to serialize DNS response");
+        response
+    }
+
+    /// Builds a DNS response with the given records (for forwarded responses).
+    pub fn build_response_with_records(&self, records: &[Record]) -> Message {
+        let mut response = Message::new();
+
+        // Set up the response header
+        let mut header = Header::response_from_request(self.message.header());
+        header.set_authoritative(false); // Not authoritative for forwarded responses
+        header.set_recursion_available(true);
+        header.set_response_code(ResponseCode::NoError);
+        response.set_header(header);
+
+        // Copy the queries from the original message
+        for query in self.message.queries() {
+            response.add_query(query.clone());
+        }
+
+        // Add all answer records
+        for record in records {
+            response.add_answer(record.clone());
+        }
 
         debug!(
-            "Built DNS response for {} -> {}",
+            "Built DNS response for {} with {} record(s)",
             self.questions()
                 .first()
                 .map(|q| q.name.as_str())
                 .unwrap_or("?"),
-            ip
+            records.len()
         );
 
-        Bytes::from(response_bytes)
+        response
+    }
+
+    /// Builds a DNS error response with the given response code.
+    pub fn build_error_response(&self, rcode: ResponseCode) -> Message {
+        let mut response = Message::new();
+
+        // Set up the response header with the error code
+        let mut header = Header::response_from_request(self.message.header());
+        header.set_authoritative(false);
+        header.set_recursion_available(true);
+        header.set_response_code(rcode);
+        response.set_header(header);
+
+        // Copy the queries from the original message
+        for query in self.message.queries() {
+            response.add_query(query.clone());
+        }
+
+        debug!(
+            "Built DNS error response ({:?}) for {}",
+            rcode,
+            self.questions()
+                .first()
+                .map(|q| q.name.as_str())
+                .unwrap_or("?"),
+        );
+
+        response
+    }
+
+    /// Builds an empty DNS response (NOERROR with no answers).
+    /// Used when the name exists but has no A records (e.g., IPv6-only).
+    pub fn build_empty_response(&self) -> Message {
+        let mut response = Message::new();
+
+        // Set up the response header - NOERROR but with no answers
+        let mut header = Header::response_from_request(self.message.header());
+        header.set_authoritative(false);
+        header.set_recursion_available(true);
+        header.set_response_code(ResponseCode::NoError);
+        response.set_header(header);
+
+        // Copy the queries from the original message
+        for query in self.message.queries() {
+            response.add_query(query.clone());
+        }
+
+        debug!(
+            "Built empty DNS response for {}",
+            self.questions()
+                .first()
+                .map(|q| q.name.as_str())
+                .unwrap_or("?"),
+        );
+
+        response
     }
 }
 
-/// Checks if a DNS name looks like a Kubernetes service name.
-pub fn is_k8s_service_name(name: &str) -> bool {
-    let name = name.trim_end_matches('.');
+/// Builds a FORMERR (format error) response from raw DNS data.
+/// Extracts the transaction ID from the raw bytes to build a minimal error response.
+/// If the data is too short, uses transaction ID 0 as fallback (per standard practice
+/// of always responding rather than silently dropping).
+pub fn build_formerr_response(dns_data: &[u8]) -> Message {
+    // Extract transaction ID from first 2 bytes, or use 0 as fallback
+    let id = if dns_data.len() >= 2 {
+        u16::from_be_bytes([dns_data[0], dns_data[1]])
+    } else {
+        0 // Fallback for truncated/empty queries
+    };
 
-    // Match patterns like:
-    // - service.namespace
-    // - service.namespace.svc
-    // - service.namespace.svc.cluster.local
+    let mut response = Message::new();
 
-    if name.ends_with(".svc.cluster.local") {
-        return true;
-    }
+    // Set up a minimal response header with FORMERR
+    let mut header = Header::new();
+    header.set_id(id);
+    header.set_message_type(MessageType::Response);
+    header.set_authoritative(false);
+    header.set_recursion_available(true);
+    header.set_response_code(ResponseCode::FormErr);
+    response.set_header(header);
 
-    if name.ends_with(".svc") {
-        return true;
-    }
+    debug!(
+        "Built FORMERR response for unparseable query (id={}, data_len={})",
+        id,
+        dns_data.len()
+    );
 
-    false
+    response
 }
 
-/// Checks if a DNS name looks like a Kubernetes pod name.
-pub fn is_k8s_pod_name(name: &str) -> bool {
-    let name = name.trim_end_matches('.');
+/// Builds a SERVFAIL (server failure) response from raw DNS data.
+/// Used when DNS resolution encounters an internal error.
+/// Extracts the transaction ID from the raw bytes to build a minimal error response.
+pub fn build_servfail_response(dns_data: &[u8]) -> Message {
+    // Extract transaction ID from first 2 bytes, or use 0 as fallback
+    let id = if dns_data.len() >= 2 {
+        u16::from_be_bytes([dns_data[0], dns_data[1]])
+    } else {
+        0 // Fallback for truncated/empty queries
+    };
 
-    // Match pod patterns:
-    // - pod-ip-with-dashes.namespace.pod.cluster.local
-    // - pod-ip-with-dashes.namespace.pod
-    if name.ends_with(".pod.cluster.local") || name.ends_with(".pod") {
-        return true;
-    }
+    let mut response = Message::new();
 
-    false
+    // Set up a minimal response header with SERVFAIL
+    let mut header = Header::new();
+    header.set_id(id);
+    header.set_message_type(MessageType::Response);
+    header.set_authoritative(false);
+    header.set_recursion_available(true);
+    header.set_response_code(ResponseCode::ServFail);
+    response.set_header(header);
+
+    debug!(
+        "Built SERVFAIL response for failed query (id={}, data_len={})",
+        id,
+        dns_data.len()
+    );
+
+    response
+}
+
+/// Result of parsing a DNS query to determine if it's a K8s resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum K8sQueryType {
+    /// Query is for a Kubernetes service.
+    Service {
+        /// The service name.
+        name: String,
+        /// The namespace.
+        namespace: String,
+    },
+    /// Query is for a Kubernetes pod.
+    Pod(PodDnsInfo),
+    /// Query is not for a Kubernetes resource (should be forwarded upstream).
+    NotK8s,
 }
 
 /// Information extracted from a pod DNS query.
@@ -190,85 +336,27 @@ impl DnsHandler {
         Self { namespaces }
     }
 
-    /// Determines if we should intercept this DNS query.
-    /// Lock-free read via ArcSwap - just loads the current snapshot.
-    pub fn should_intercept(&self, query: &DnsQuery) -> bool {
+    /// Parses a DNS query and determines if it's for a K8s service, pod, or neither.
+    ///
+    /// This method combines the logic of `should_intercept`, `is_pod_query`, and
+    /// extraction methods into a single unified parsing pass.
+    ///
+    /// Returns:
+    /// - `K8sQueryType::Service` if the query is for a K8s service
+    /// - `K8sQueryType::Pod` if the query is for a K8s pod
+    /// - `K8sQueryType::NotK8s` if the query should be forwarded upstream
+    pub fn parse_k8s_query(&self, query: &DnsQuery) -> K8sQueryType {
         let namespaces = self.namespaces.load();
 
         for question in query.questions() {
-            if question.qtype != RecordType::A {
-                continue;
-            }
-
-            // Always intercept .svc.cluster.local queries
-            if is_k8s_service_name(&question.name) {
-                return true;
-            }
-
-            // Always intercept .pod.cluster.local queries
-            if is_k8s_pod_name(&question.name) {
-                return true;
-            }
-
-            let parts: Vec<&str> = question.name.split('.').collect();
-            if parts.len() != 2 {
-                continue;
-            }
-            let tld = parts[1].to_lowercase();
-            // Check if it matches any known Kubernetes namespace
-            for ns in namespaces.iter() {
-                // Match patterns like "service.namespace" or "service.namespace.svc"
-                if tld.eq(ns) {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Checks if this is a pod DNS query (vs a service query).
-    pub fn is_pod_query(&self, query: &DnsQuery) -> bool {
-        for question in query.questions() {
-            if question.qtype != RecordType::A {
-                continue;
-            }
-
-            // Check for .pod or .pod.cluster.local suffix
-            if is_k8s_pod_name(&question.name) {
-                return true;
-            }
-
-            // Check for StatefulSet pattern: pod-name.service.namespace.svc.cluster.local
-            // This has 3 parts before .svc.cluster.local (vs 2 for services)
-            let name = question.name.trim_end_matches('.');
-            if let Some(stripped) = name
-                .strip_suffix(".svc.cluster.local")
-                .or_else(|| name.strip_suffix(".svc"))
-            {
-                let parts: Vec<&str> = stripped.split('.').collect();
-                // 3 parts = pod.service.namespace (StatefulSet/hostname pattern)
-                // 2 parts = service.namespace (regular service)
-                if parts.len() == 3 {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Extracts pod information from a DNS query.
-    /// Returns None if this is not a pod DNS query.
-    pub fn extract_pod_info(&self, query: &DnsQuery) -> Option<PodDnsInfo> {
-        for question in query.questions() {
+            // Only handle A record queries
             if question.qtype != RecordType::A {
                 continue;
             }
 
             let name = question.name.trim_end_matches('.');
 
-            // Try to parse as IP-based pod DNS: pod-ip.namespace.pod.cluster.local
+            // Check for IP-based pod DNS: pod-ip.namespace.pod.cluster.local
             if let Some(stripped) = name
                 .strip_suffix(".pod.cluster.local")
                 .or_else(|| name.strip_suffix(".pod"))
@@ -276,7 +364,7 @@ impl DnsHandler {
                 let parts: Vec<&str> = stripped.splitn(2, '.').collect();
                 if parts.len() == 2 {
                     if let Some(ip) = parse_dashed_ip(parts[0]) {
-                        return Some(PodDnsInfo::Ip {
+                        return K8sQueryType::Pod(PodDnsInfo::Ip {
                             ip,
                             namespace: parts[1].to_string(),
                         });
@@ -284,72 +372,61 @@ impl DnsHandler {
                 }
             }
 
-            // Try to parse as StatefulSet pod DNS: pod-name.service.namespace.svc.cluster.local
+            // Check for .svc.cluster.local or .svc suffix patterns
             if let Some(stripped) = name
                 .strip_suffix(".svc.cluster.local")
                 .or_else(|| name.strip_suffix(".svc"))
             {
                 let parts: Vec<&str> = stripped.split('.').collect();
-                if parts.len() == 3 {
-                    // This could be either StatefulSet or hostname pattern
-                    // We treat them the same way for now
-                    return Some(PodDnsInfo::StatefulSet {
-                        pod_name: parts[0].to_string(),
-                        service: parts[1].to_string(),
-                        namespace: parts[2].to_string(),
-                    });
+                match parts.len() {
+                    // 2 parts = service.namespace (regular service)
+                    2 => {
+                        return K8sQueryType::Service {
+                            name: parts[0].to_string(),
+                            namespace: parts[1].to_string(),
+                        };
+                    }
+                    // 3 parts = pod.service.namespace (StatefulSet pod)
+                    3 => {
+                        return K8sQueryType::Pod(PodDnsInfo::StatefulSet {
+                            pod_name: parts[0].to_string(),
+                            service: parts[1].to_string(),
+                            namespace: parts[2].to_string(),
+                        });
+                    }
+                    _ => continue,
                 }
+            }
+
+            // Check for short names (service.namespace or pod.service.namespace)
+            let parts: Vec<&str> = name.split('.').collect();
+            match parts.len() {
+                // 2 parts = service.namespace (if namespace is known)
+                2 => {
+                    let namespace = parts[1].to_lowercase();
+                    if namespaces.contains(&*namespace) {
+                        return K8sQueryType::Service {
+                            name: parts[0].to_string(),
+                            namespace: parts[1].to_string(),
+                        };
+                    }
+                }
+                // 3 parts = pod.service.namespace (if namespace is known)
+                3 => {
+                    let namespace = parts[2].to_lowercase();
+                    if namespaces.contains(&*namespace) {
+                        return K8sQueryType::Pod(PodDnsInfo::StatefulSet {
+                            pod_name: parts[0].to_string(),
+                            service: parts[1].to_string(),
+                            namespace: parts[2].to_string(),
+                        });
+                    }
+                }
+                _ => continue,
             }
         }
 
-        None
-    }
-
-    /// Extracts the service name and namespace from a DNS query.
-    /// Lock-free read via ArcSwap - just loads the current snapshot.
-    pub fn extract_service_info(&self, query: &DnsQuery) -> Option<(String, String)> {
-        let namespaces = self.namespaces.load();
-
-        for question in query.questions() {
-            if question.qtype != RecordType::A {
-                continue;
-            }
-
-            let name = question.name.trim_end_matches('.');
-
-            // Skip pod DNS patterns
-            if is_k8s_pod_name(name) {
-                continue;
-            }
-
-            // Try to parse as service.namespace.svc.cluster.local
-            if let Some(stripped) = name.strip_suffix(".svc.cluster.local") {
-                let parts: Vec<&str> = stripped.split('.').collect();
-                // Only 2 parts = service.namespace (not StatefulSet pattern with 3 parts)
-                if parts.len() == 2 {
-                    return Some((parts[0].to_string(), parts[1].to_string()));
-                }
-            }
-
-            // Try to parse as service.namespace.svc
-            if let Some(stripped) = name.strip_suffix(".svc") {
-                let parts: Vec<&str> = stripped.split('.').collect();
-                if parts.len() == 2 {
-                    return Some((parts[0].to_string(), parts[1].to_string()));
-                }
-            }
-
-            // Try to parse as service.namespace
-            let parts: Vec<&str> = name.splitn(2, '.').collect();
-            if parts.len() == 2 {
-                // Check if namespace matches any known Kubernetes namespace
-                if namespaces.contains(parts[1]) {
-                    return Some((parts[0].to_string(), parts[1].to_string()));
-                }
-            }
-        }
-
-        None
+        K8sQueryType::NotK8s
     }
 }
 
@@ -370,35 +447,47 @@ mod tests {
     }
 
     #[test]
-    fn test_dns_handler_should_intercept() {
+    fn test_parse_k8s_query_service() {
         let handler = DnsHandler::new(make_namespace_set(vec!["default", "production"]));
 
         // Create a mock DNS query packet for backend.default
         let query_packet = build_test_query("backend.default");
         let query = DnsQuery::parse(&query_packet).unwrap();
 
-        assert!(handler.should_intercept(&query));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Service { .. }
+        ));
 
         // Create a query for google.com - should not intercept
         let query_packet2 = build_test_query("google.com");
         let query2 = DnsQuery::parse(&query_packet2).unwrap();
 
-        assert!(!handler.should_intercept(&query2));
+        assert!(matches!(
+            handler.parse_k8s_query(&query2),
+            K8sQueryType::NotK8s
+        ));
     }
 
     #[test]
-    fn test_dns_handler_should_intercept_pods() {
+    fn test_parse_k8s_query_pods() {
         let handler = DnsHandler::new(make_namespace_set(vec!["default"]));
 
         // Pod IP-based DNS
         let query =
             DnsQuery::parse(&build_test_query("172-17-0-3.default.pod.cluster.local")).unwrap();
-        assert!(handler.should_intercept(&query));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(_)
+        ));
 
         // StatefulSet pod DNS
         let query =
             DnsQuery::parse(&build_test_query("mysql-0.mysql.default.svc.cluster.local")).unwrap();
-        assert!(handler.should_intercept(&query));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(_)
+        ));
     }
 
     #[test]
@@ -416,51 +505,59 @@ mod tests {
         let ip = Ipv4Addr::new(198, 18, 0, 1);
         let response = query.build_response(ip);
 
-        // Parse the response to verify it's valid
-        let response_msg = Message::from_vec(&response).unwrap();
-        assert_eq!(response_msg.message_type(), MessageType::Response);
-        assert_eq!(response_msg.answers().len(), 1);
+        // Verify the response is valid
+        assert_eq!(response.message_type(), MessageType::Response);
+        assert_eq!(response.answers().len(), 1);
 
-        match response_msg.answers()[0].data() {
+        match response.answers()[0].data() {
             RData::A(a) => assert_eq!(a.0, ip),
             _ => panic!("Expected A record in response"),
         }
     }
 
     #[test]
-    fn test_extract_service_info() {
+    fn test_parse_k8s_query_service_info() {
         let handler = DnsHandler::new(make_namespace_set(vec!["default"]));
 
         // Test service.namespace.svc.cluster.local
         let query =
             DnsQuery::parse(&build_test_query("backend.default.svc.cluster.local")).unwrap();
-        let info = handler.extract_service_info(&query);
-        assert_eq!(info, Some(("backend".to_string(), "default".to_string())));
+        assert_eq!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Service {
+                name: "backend".to_string(),
+                namespace: "default".to_string()
+            }
+        );
 
         // Test service.namespace.svc
         let query = DnsQuery::parse(&build_test_query("api.production.svc")).unwrap();
         let handler2 = DnsHandler::new(make_namespace_set(vec!["production"]));
-        let info = handler2.extract_service_info(&query);
-        assert_eq!(info, Some(("api".to_string(), "production".to_string())));
+        assert_eq!(
+            handler2.parse_k8s_query(&query),
+            K8sQueryType::Service {
+                name: "api".to_string(),
+                namespace: "production".to_string()
+            }
+        );
 
         // Test service.namespace (with matching namespace)
         let query = DnsQuery::parse(&build_test_query("web.default")).unwrap();
-        let info = handler.extract_service_info(&query);
-        assert_eq!(info, Some(("web".to_string(), "default".to_string())));
+        assert_eq!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Service {
+                name: "web".to_string(),
+                namespace: "default".to_string()
+            }
+        );
 
-        // StatefulSet pattern should NOT be extracted as service info
+        // StatefulSet pattern should be recognized as Pod, not Service
         let query =
             DnsQuery::parse(&build_test_query("mysql-0.mysql.default.svc.cluster.local")).unwrap();
-        let info = handler.extract_service_info(&query);
-        assert_eq!(info, None);
-    }
-
-    #[test]
-    fn test_is_k8s_pod_name() {
-        assert!(is_k8s_pod_name("172-17-0-3.default.pod.cluster.local"));
-        assert!(is_k8s_pod_name("172-17-0-3.default.pod"));
-        assert!(!is_k8s_pod_name("backend.default.svc.cluster.local"));
-        assert!(!is_k8s_pod_name("google.com"));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(_)
+        ));
     }
 
     #[test]
@@ -480,40 +577,51 @@ mod tests {
     }
 
     #[test]
-    fn test_is_pod_query() {
+    fn test_parse_k8s_query_pod_types() {
         let handler = DnsHandler::new(make_namespace_set(vec!["default"]));
 
         // Pod IP-based DNS
         let query =
             DnsQuery::parse(&build_test_query("172-17-0-3.default.pod.cluster.local")).unwrap();
-        assert!(handler.is_pod_query(&query));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(_)
+        ));
 
         // StatefulSet pod DNS (3 parts before .svc.cluster.local)
         let query =
             DnsQuery::parse(&build_test_query("mysql-0.mysql.default.svc.cluster.local")).unwrap();
-        assert!(handler.is_pod_query(&query));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(_)
+        ));
 
         // Regular service DNS (2 parts before .svc.cluster.local)
         let query =
             DnsQuery::parse(&build_test_query("backend.default.svc.cluster.local")).unwrap();
-        assert!(!handler.is_pod_query(&query));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Service { .. }
+        ));
 
         // Short service name
         let query = DnsQuery::parse(&build_test_query("backend.default")).unwrap();
-        assert!(!handler.is_pod_query(&query));
+        assert!(matches!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Service { .. }
+        ));
     }
 
     #[test]
-    fn test_extract_pod_info_by_ip() {
+    fn test_parse_k8s_query_pod_by_ip() {
         let handler = DnsHandler::new(make_namespace_set(vec!["default"]));
 
         // Full pod DNS name
         let query =
             DnsQuery::parse(&build_test_query("172-17-0-3.default.pod.cluster.local")).unwrap();
-        let info = handler.extract_pod_info(&query);
         assert_eq!(
-            info,
-            Some(PodDnsInfo::Ip {
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(PodDnsInfo::Ip {
                 ip: Ipv4Addr::new(172, 17, 0, 3),
                 namespace: "default".to_string(),
             })
@@ -521,10 +629,9 @@ mod tests {
 
         // Short pod DNS name
         let query = DnsQuery::parse(&build_test_query("10-0-0-1.production.pod")).unwrap();
-        let info = handler.extract_pod_info(&query);
         assert_eq!(
-            info,
-            Some(PodDnsInfo::Ip {
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(PodDnsInfo::Ip {
                 ip: Ipv4Addr::new(10, 0, 0, 1),
                 namespace: "production".to_string(),
             })
@@ -532,44 +639,58 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_pod_info_statefulset() {
-        let handler = DnsHandler::new(make_namespace_set(vec!["default"]));
+    fn test_parse_k8s_query_pod_statefulset() {
+        let handler = DnsHandler::new(make_namespace_set(vec!["default", "cache"]));
 
-        // StatefulSet pod DNS
+        // StatefulSet pod DNS (full form)
         let query =
             DnsQuery::parse(&build_test_query("mysql-0.mysql.default.svc.cluster.local")).unwrap();
-        let info = handler.extract_pod_info(&query);
         assert_eq!(
-            info,
-            Some(PodDnsInfo::StatefulSet {
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(PodDnsInfo::StatefulSet {
                 pod_name: "mysql-0".to_string(),
                 service: "mysql".to_string(),
                 namespace: "default".to_string(),
             })
         );
 
-        // Short StatefulSet pod DNS
+        // StatefulSet pod DNS with .svc suffix
         let query = DnsQuery::parse(&build_test_query("redis-1.redis.cache.svc")).unwrap();
-        let info = handler.extract_pod_info(&query);
         assert_eq!(
-            info,
-            Some(PodDnsInfo::StatefulSet {
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(PodDnsInfo::StatefulSet {
                 pod_name: "redis-1".to_string(),
                 service: "redis".to_string(),
                 namespace: "cache".to_string(),
             })
         );
+
+        // StatefulSet pod DNS - SHORT FORM without .svc suffix (e.g., curl http://mysql-0.mysql.default:3306/)
+        let query = DnsQuery::parse(&build_test_query("mysql-0.mysql.default")).unwrap();
+        assert_eq!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Pod(PodDnsInfo::StatefulSet {
+                pod_name: "mysql-0".to_string(),
+                service: "mysql".to_string(),
+                namespace: "default".to_string(),
+            })
+        );
     }
 
     #[test]
-    fn test_extract_pod_info_not_pod() {
+    fn test_parse_k8s_query_service_not_pod() {
         let handler = DnsHandler::new(make_namespace_set(vec!["default"]));
 
-        // Regular service DNS should return None
+        // Regular service DNS should be recognized as Service, not Pod
         let query =
             DnsQuery::parse(&build_test_query("backend.default.svc.cluster.local")).unwrap();
-        let info = handler.extract_pod_info(&query);
-        assert_eq!(info, None);
+        assert_eq!(
+            handler.parse_k8s_query(&query),
+            K8sQueryType::Service {
+                name: "backend".to_string(),
+                namespace: "default".to_string()
+            }
+        );
     }
 
     /// Helper to build a test DNS query packet.

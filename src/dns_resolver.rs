@@ -5,7 +5,8 @@
 //! - Forwards non-K8s queries to upstream DNS servers
 //! - Uses interface-bound sockets to bypass TUN routing
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::runtime::iocompat::AsyncIoTokioAsStd;
 use hickory_proto::runtime::{RuntimeProvider, Spawn, TokioTime};
 use hickory_proto::xfer::Protocol;
@@ -23,9 +24,10 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
-use crate::dns::{DnsHandler, DnsQuery, PodDnsInfo};
+use crate::dns::{build_formerr_response, DnsHandler, DnsQuery, K8sQueryType, PodDnsInfo};
+use crate::k8s::K8sClient;
 use crate::vip::{PodId, ServiceId, VipManager};
 
 #[cfg(target_os = "macos")]
@@ -226,6 +228,8 @@ pub struct DnsResolver {
     dns_handler: Arc<DnsHandler>,
     /// VIP manager for allocating virtual IPs.
     vip_manager: Arc<VipManager>,
+    /// Kubernetes client for validating resources.
+    k8s_client: Arc<K8sClient>,
 }
 
 impl DnsResolver {
@@ -234,6 +238,7 @@ impl DnsResolver {
         config: DnsResolverConfig,
         dns_handler: Arc<DnsHandler>,
         vip_manager: Arc<VipManager>,
+        k8s_client: Arc<K8sClient>,
     ) -> Result<Self> {
         info!(
             "Creating DNS resolver with upstream {} via interface '{}'",
@@ -270,24 +275,20 @@ impl DnsResolver {
             upstream_resolver,
             dns_handler,
             vip_manager,
+            k8s_client,
         })
     }
 
-    /// Resolves a DNS query and returns the response bytes.
+    /// Resolves a DNS query and returns the response message.
     ///
-    /// If the query is for a K8s service or pod, returns a VIP.
-    /// Otherwise, forwards to the upstream DNS server.
-    pub async fn resolve(&self, dns_data: &[u8]) -> Result<Option<Vec<u8>>> {
-        if dns_data.is_empty() {
-            return Ok(None);
-        }
-
+    /// If the query is for a K8s service or pod, validates the resource exists
+    /// and returns a VIP. Otherwise, forwards to the upstream DNS server.
+    pub async fn resolve(&self, dns_data: &[u8]) -> Result<Message> {
         // Parse the DNS query
         let query = match DnsQuery::parse(dns_data) {
             Ok(q) => q,
             Err(e) => {
                 debug!("Failed to parse DNS query: {}", e);
-                // If we can't parse it, try to forward anyway
                 return self.forward_raw_query(dns_data).await;
             }
         };
@@ -295,61 +296,64 @@ impl DnsResolver {
         let query_names: Vec<_> = query.questions().iter().map(|q| q.name.clone()).collect();
         debug!("DNS query for: {:?}", query_names);
 
-        // Check if we should intercept this query (K8s service or pod)
-        if !self.dns_handler.should_intercept(&query) {
-            trace!("Not intercepting DNS query for {:?}", query_names);
-            return self.forward_query(&query, &query_names).await;
-        }
-
-        // Check if this is a pod query first
-        if self.dns_handler.is_pod_query(&query) {
-            return self.resolve_pod_query(&query, &query_names).await;
-        }
-
-        // Extract service info and resolve to VIP
-        let (service_name, namespace) = match self.dns_handler.extract_service_info(&query) {
-            Some(info) => info,
-            None => {
-                debug!("Could not extract service info from query");
-                return self.forward_query(&query, &query_names).await;
+        // Parse the query to determine if it's a K8s service, pod, or external
+        match self.dns_handler.parse_k8s_query(&query) {
+            K8sQueryType::Service { name, namespace } => {
+                self.resolve_service(&query, &name, &namespace).await
             }
-        };
-
-        // Get or allocate a VIP for this service
-        let service = ServiceId::new(&service_name, &namespace, 80); // Default port
-        let vip = self
-            .vip_manager
-            .get_or_allocate_vip(service)
-            .await
-            .context("Failed to allocate VIP")?;
-
-        info!("DNS: {}.{} -> {}", service_name, namespace, vip);
-
-        // Build and return the response
-        let response = query.build_response(vip);
-        Ok(Some(response.to_vec()))
+            K8sQueryType::Pod(pod_info) => self.resolve_pod(&query, pod_info).await,
+            K8sQueryType::NotK8s => {
+                trace!("Not intercepting DNS query for {:?}", query_names);
+                self.forward_query(&query, &query_names).await
+            }
+        }
     }
 
-    /// Resolves a pod DNS query and returns the response bytes.
-    async fn resolve_pod_query(
+    /// Resolves a service DNS query, validating it exists before allocating a VIP.
+    async fn resolve_service(
         &self,
         query: &DnsQuery,
-        query_names: &[String],
-    ) -> Result<Option<Vec<u8>>> {
-        let pod_info = match self.dns_handler.extract_pod_info(query) {
-            Some(info) => info,
-            None => {
-                debug!("Could not extract pod info from query");
-                return self.forward_query(query, query_names).await;
+        service_name: &str,
+        namespace: &str,
+    ) -> Result<Message> {
+        // Validate that the service exists in Kubernetes before allocating a VIP
+        let service = ServiceId::new(service_name, namespace, 80);
+        if let Err(e) = self.k8s_client.get_service_endpoints(&service).await {
+            debug!(
+                "Service {}.{} not found in K8s: {}",
+                service_name, namespace, e
+            );
+            return Ok(query.build_error_response(ResponseCode::NXDomain));
+        }
+
+        // Get or allocate a VIP for this service (only after validation)
+        let vip = match self.vip_manager.get_or_allocate_vip(service).await {
+            Ok(vip) => vip,
+            Err(e) => {
+                debug!(
+                    "Failed to allocate VIP for {}.{}: {}",
+                    service_name, namespace, e
+                );
+                return Ok(query.build_error_response(ResponseCode::ServFail));
             }
         };
 
-        // Create a PodId and allocate a VIP based on the pod info type
+        info!("DNS: {}.{} -> {}", service_name, namespace, vip);
+        Ok(query.build_response(vip))
+    }
+
+    /// Resolves a pod DNS query, validating it exists before allocating a VIP.
+    async fn resolve_pod(&self, query: &DnsQuery, pod_info: PodDnsInfo) -> Result<Message> {
+        // Validate pod exists in Kubernetes and create PodId based on the pod info type
         let (pod_id, log_name) = match &pod_info {
             PodDnsInfo::Ip { ip, namespace } => {
-                // For IP-based queries, use the IP as the pod name
-                // The actual pod lookup will happen when the connection is made
-                let pod_name = ip.to_string().replace('.', "-");
+                // Validate pod exists by IP before allocating VIP
+                let ip_str = ip.to_string();
+                if let Err(e) = self.k8s_client.get_pod_by_ip(&ip_str, namespace, 80).await {
+                    debug!("Pod with IP {} not found in {}: {}", ip, namespace, e);
+                    return Ok(query.build_error_response(ResponseCode::NXDomain));
+                }
+                let pod_name = ip_str.replace('.', "-");
                 (
                     PodId::new(&pod_name, namespace, 80),
                     format!("{}.{}.pod", ip, namespace),
@@ -357,18 +361,40 @@ impl DnsResolver {
             }
             PodDnsInfo::StatefulSet {
                 pod_name,
-                service,
+                service: _,
                 namespace,
-            } => (
-                PodId::new(pod_name, namespace, 80),
-                format!("{}.{}.{}", pod_name, service, namespace),
-            ),
+            } => {
+                // Validate StatefulSet pod exists before allocating VIP
+                if let Err(e) = self
+                    .k8s_client
+                    .get_pod_by_name(pod_name, namespace, 80)
+                    .await
+                {
+                    debug!("Pod {} not found in {}: {}", pod_name, namespace, e);
+                    return Ok(query.build_error_response(ResponseCode::NXDomain));
+                }
+                (
+                    PodId::new(pod_name, namespace, 80),
+                    format!("{}.{}", pod_name, namespace),
+                )
+            }
             PodDnsInfo::Hostname {
                 hostname,
                 subdomain,
                 namespace,
             } => {
-                // For hostname-based queries, combine hostname and subdomain as the pod identifier
+                // Validate pod with hostname/subdomain exists before allocating VIP
+                if let Err(e) = self
+                    .k8s_client
+                    .get_pod_by_hostname(hostname, subdomain, namespace, 80)
+                    .await
+                {
+                    debug!(
+                        "Pod with hostname {}.{} not found in {}: {}",
+                        hostname, subdomain, namespace, e
+                    );
+                    return Ok(query.build_error_response(ResponseCode::NXDomain));
+                }
                 let pod_name = format!("{}.{}", hostname, subdomain);
                 (
                     PodId::new(&pod_name, namespace, 80),
@@ -377,74 +403,85 @@ impl DnsResolver {
             }
         };
 
-        // Get or allocate a VIP for this pod
-        let vip = self
-            .vip_manager
-            .get_or_allocate_vip_for_pod(pod_id)
-            .await
-            .context("Failed to allocate VIP for pod")?;
-
-        info!("DNS (pod): {} -> {}", log_name, vip);
-
-        // Build and return the response
-        let response = query.build_response(vip);
-        Ok(Some(response.to_vec()))
-    }
-
-    /// Forwards a parsed query to the upstream DNS server using hickory-resolver.
-    async fn forward_query(
-        &self,
-        query: &DnsQuery,
-        query_names: &[String],
-    ) -> Result<Option<Vec<u8>>> {
-        // Get the questions and find an A/AAAA record
-        let questions = query.questions();
-        let question = match questions.iter().find(|q| {
-            q.qtype == hickory_proto::rr::RecordType::A
-                || q.qtype == hickory_proto::rr::RecordType::AAAA
-        }) {
-            Some(q) => q,
-            None => {
-                debug!("No A/AAAA record in query, skipping");
-                return Ok(None);
+        // Get or allocate a VIP for this pod (only after validation)
+        let vip = match self.vip_manager.get_or_allocate_vip_for_pod(pod_id).await {
+            Ok(vip) => vip,
+            Err(e) => {
+                debug!("Failed to allocate VIP for pod {}: {}", log_name, e);
+                return Ok(query.build_error_response(ResponseCode::ServFail));
             }
         };
 
-        debug!("Forwarding query for {} to upstream", question.name);
+        info!("DNS (pod): {} -> {}", log_name, vip);
+        Ok(query.build_response(vip))
+    }
 
-        // Use hickory-resolver to resolve
-        match self.upstream_resolver.lookup_ip(&question.name).await {
+    /// Forwards a parsed query to the upstream DNS server using hickory-resolver.
+    async fn forward_query(&self, query: &DnsQuery, query_names: &[String]) -> Result<Message> {
+        // Get the first question to forward
+        let questions = query.questions();
+        let question = match questions.first() {
+            Some(q) => q,
+            None => {
+                debug!("No questions in query, returning empty response");
+                return Ok(query.build_empty_response());
+            }
+        };
+
+        debug!(
+            "Forwarding {:?} query for {} to upstream",
+            question.qtype, question.name
+        );
+
+        // Use hickory-resolver to resolve with the actual record type
+        match self
+            .upstream_resolver
+            .lookup(&question.name, question.qtype)
+            .await
+        {
             Ok(lookup) => {
-                debug!("Upstream resolved {:?} for {}", query_names, question.name);
+                debug!(
+                    "Upstream resolved {:?} for {} with {} records",
+                    query_names,
+                    question.name,
+                    lookup.records().len()
+                );
 
-                // Build response with the first IPv4 address
-                if let Some(ip) = lookup.iter().find_map(|addr| match addr {
-                    std::net::IpAddr::V4(v4) => Some(v4),
-                    _ => None,
-                }) {
-                    let response = query.build_response(ip);
-                    return Ok(Some(response.to_vec()));
-                }
-
-                debug!("No IPv4 address in upstream response");
-                Ok(None)
+                // Build response with all records from the lookup
+                Ok(query.build_response_with_records(lookup.records()))
             }
             Err(e) => {
-                warn!(
-                    "Upstream DNS resolution failed for {}: {}",
-                    question.name, e
+                // Determine appropriate DNS response code based on error type
+                let rcode = if e.is_nx_domain() {
+                    hickory_proto::op::ResponseCode::NXDomain
+                } else if e.is_no_records_found() {
+                    // Domain exists but no records of the requested type
+                    hickory_proto::op::ResponseCode::NoError
+                } else {
+                    // For other errors (timeout, network issues, etc.), return SERVFAIL
+                    hickory_proto::op::ResponseCode::ServFail
+                };
+
+                debug!(
+                    "Upstream DNS resolution failed for {}: {} (returning {:?})",
+                    question.name, e, rcode
                 );
-                Ok(None)
+
+                if e.is_no_records_found() && !e.is_nx_domain() {
+                    // Return empty response for "no records" (domain exists)
+                    Ok(query.build_empty_response())
+                } else {
+                    Ok(query.build_error_response(rcode))
+                }
             }
         }
     }
 
     /// Forwards a raw DNS query that couldn't be parsed.
-    async fn forward_raw_query(&self, _dns_data: &[u8]) -> Result<Option<Vec<u8>>> {
-        // For unparseable queries, we can't use hickory-resolver's high-level API
-        // Just return None and let the client retry
-        debug!("Cannot forward unparseable DNS query");
-        Ok(None)
+    async fn forward_raw_query(&self, dns_data: &[u8]) -> Result<Message> {
+        // For unparseable queries, return FORMERR (format error) response
+        debug!("Cannot forward unparseable DNS query, returning FORMERR");
+        Ok(build_formerr_response(dns_data))
     }
 }
 
@@ -464,7 +501,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Kubernetes cluster connection"]
     async fn test_resolver_creation() {
+        // This test requires a running Kubernetes cluster to create a K8sClient
+        // Run with: cargo test -- --ignored
         let config = DnsResolverConfig {
             upstream_dns: Ipv4Addr::new(8, 8, 8, 8),
             bind_interface: "en0".to_string(),
@@ -472,8 +512,13 @@ mod tests {
 
         let dns_handler = Arc::new(DnsHandler::new(make_namespace_set(vec!["default"])));
         let vip_manager = Arc::new(VipManager::new(Ipv4Addr::new(198, 18, 0, 0)));
+        let k8s_client = Arc::new(
+            K8sClient::new(None)
+                .await
+                .expect("Failed to create K8s client"),
+        );
 
-        let resolver = DnsResolver::new(config, dns_handler, vip_manager).await;
+        let resolver = DnsResolver::new(config, dns_handler, vip_manager, k8s_client).await;
         assert!(resolver.is_ok());
     }
 }

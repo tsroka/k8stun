@@ -231,6 +231,7 @@ async fn main() -> Result<()> {
                         resolver_config,
                         Arc::clone(&dns_handler),
                         Arc::clone(&vip_manager),
+                        Arc::clone(&k8s_client),
                     )
                     .await
                     {
