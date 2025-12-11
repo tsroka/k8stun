@@ -49,6 +49,7 @@ arc-swap = "1.7"
 
 # DNS protocol
 hickory-proto = "0.25"
+hickory-resolver = "0.25"
 
 # Async utilities
 async-trait = "0.1"

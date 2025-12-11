@@ -8,25 +8,15 @@
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use lwip::{NetStack, TcpListener, UdpSocket};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use tun2::AsyncDevice;
 
-use crate::dns::{DnsHandler, DnsQuery};
-use crate::dns_intercept::forward_dns_query;
+use crate::dns_resolver::DnsResolver;
 use crate::vip::{ServiceId, VipManager};
-
-/// Configuration for DNS forwarding when interception is enabled.
-#[derive(Clone)]
-pub struct DnsForwardConfig {
-    /// The original system DNS server to forward to.
-    pub system_dns: Ipv4Addr,
-    /// The network interface to bind to (bypasses TUN).
-    pub bind_interface: String,
-}
 
 /// A TCP stream from the userspace stack.
 pub struct TcpStream {
@@ -88,7 +78,6 @@ pub struct AcceptedConnection {
 /// The userspace network stack that handles TCP connections.
 pub struct NetworkStack {
     vip_manager: Arc<VipManager>,
-    dns_handler: Arc<DnsHandler>,
     /// Channel to receive accepted TCP connections.
     connection_rx: mpsc::Receiver<AcceptedConnection>,
 }
@@ -98,17 +87,7 @@ impl NetworkStack {
     pub async fn new(
         device: AsyncDevice,
         vip_manager: Arc<VipManager>,
-        dns_handler: Arc<DnsHandler>,
-    ) -> Result<Self> {
-        Self::with_dns_forward(device, vip_manager, dns_handler, None).await
-    }
-
-    /// Creates a new network stack with optional DNS forwarding configuration.
-    pub async fn with_dns_forward(
-        device: AsyncDevice,
-        vip_manager: Arc<VipManager>,
-        dns_handler: Arc<DnsHandler>,
-        dns_forward: Option<DnsForwardConfig>,
+        dns_resolver: Option<Arc<DnsResolver>>,
     ) -> Result<Self> {
         let (connection_tx, connection_rx) = mpsc::channel(64);
 
@@ -128,33 +107,21 @@ impl NetworkStack {
         });
 
         // Spawn the UDP/DNS handling task
-        let vip_manager_clone = Arc::clone(&vip_manager);
-        let dns_handler_clone = Arc::clone(&dns_handler);
-        let dns_forward_clone = dns_forward.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_handler(
-                udp_socket,
-                vip_manager_clone,
-                dns_handler_clone,
-                dns_forward_clone,
-            )
-            .await
-            {
-                error!("UDP handler error: {}", e);
-            }
-        });
+        if let Some(resolver) = dns_resolver {
+            info!("DNS resolver enabled");
+            tokio::spawn(async move {
+                if let Err(e) = run_udp_handler(udp_socket, resolver).await {
+                    error!("UDP handler error: {}", e);
+                }
+            });
+        } else {
+            info!("DNS resolver not configured, UDP packets will not be handled");
+        }
 
         info!("Network stack started, waiting for connections...");
-        if let Some(ref cfg) = dns_forward {
-            info!(
-                "DNS forwarding enabled: {} via interface '{}'",
-                cfg.system_dns, cfg.bind_interface
-            );
-        }
 
         Ok(Self {
             vip_manager,
-            dns_handler,
             connection_rx,
         })
     }
@@ -289,12 +256,7 @@ async fn run_tcp_listener(
 }
 
 /// Handles UDP packets, primarily for DNS resolution.
-async fn run_udp_handler(
-    udp_socket: Box<UdpSocket>,
-    vip_manager: Arc<VipManager>,
-    dns_handler: Arc<DnsHandler>,
-    dns_forward: Option<DnsForwardConfig>,
-) -> Result<()> {
+async fn run_udp_handler(udp_socket: Box<UdpSocket>, dns_resolver: Arc<DnsResolver>) -> Result<()> {
     let (udp_writer, mut udp_reader) = udp_socket.split();
 
     // Process incoming UDP packets
@@ -303,12 +265,8 @@ async fn run_udp_handler(
 
         // Check if this is a DNS query (port 53)
         if dst_addr.port() == 53 {
-            let vip_manager = Arc::clone(&vip_manager);
-            let dns_handler = Arc::clone(&dns_handler);
-
-            // Handle DNS and get response
-            match handle_dns_query(&payload, &vip_manager, &dns_handler, dns_forward.as_ref()).await
-            {
+            // Use the DnsResolver to handle the query
+            match dns_resolver.resolve(&payload).await {
                 Ok(Some(response)) => {
                     // Send response back: swap src and dst addresses
                     if let Err(e) = udp_writer.send_to(&response, &dst_addr, &src_addr) {
@@ -326,86 +284,6 @@ async fn run_udp_handler(
     }
 
     Ok(())
-}
-
-/// Handles a DNS query and returns the response bytes if any.
-async fn handle_dns_query(
-    dns_data: &[u8],
-    vip_manager: &VipManager,
-    dns_handler: &DnsHandler,
-    dns_forward: Option<&DnsForwardConfig>,
-) -> Result<Option<Vec<u8>>> {
-    if dns_data.is_empty() {
-        return Ok(None);
-    }
-
-    // Parse the DNS query
-    let query = match DnsQuery::parse(dns_data) {
-        Ok(q) => q,
-        Err(e) => {
-            debug!("Failed to parse DNS query: {}", e);
-            // If we can't parse it but have DNS forwarding, forward anyway
-            if let Some(cfg) = dns_forward {
-                debug!("Forwarding unparseable query to system DNS");
-                if let Ok(response) =
-                    forward_dns_query(dns_data, cfg.system_dns, &cfg.bind_interface).await
-                {
-                    return Ok(Some(response));
-                }
-            }
-            return Ok(None);
-        }
-    };
-
-    let query_names: Vec<_> = query.questions().iter().map(|q| q.name.clone()).collect();
-    debug!("DNS query for: {:?}", query_names);
-
-    // Check if we should intercept this query (lock-free read)
-    if !dns_handler.should_intercept(&query) {
-        debug!("Not intercepting DNS query for {:?}", query_names);
-
-        // Forward to system DNS if configured
-        if let Some(cfg) = dns_forward {
-            debug!("Forwarding to system DNS: {}", cfg.system_dns);
-            match forward_dns_query(dns_data, cfg.system_dns, &cfg.bind_interface).await {
-                Ok(response) => {
-                    debug!("Forwarded DNS response for {:?}", query_names);
-                    return Ok(Some(response));
-                }
-                Err(e) => {
-                    warn!("Failed to forward DNS query: {}", e);
-                }
-            }
-        }
-        return Ok(None);
-    }
-
-    // Extract service info (lock-free read)
-    let (service_name, namespace) = match dns_handler.extract_service_info(&query) {
-        Some(info) => info,
-        None => {
-            debug!("Could not extract service info from query");
-            // Forward to system DNS if we can't extract service info
-            if let Some(cfg) = dns_forward {
-                if let Ok(response) =
-                    forward_dns_query(dns_data, cfg.system_dns, &cfg.bind_interface).await
-                {
-                    return Ok(Some(response));
-                }
-            }
-            return Ok(None);
-        }
-    };
-
-    // Get or allocate a VIP for this service
-    let service = ServiceId::new(&service_name, &namespace, 80); // Default port
-    let vip = vip_manager.get_or_allocate_vip(service).await?;
-
-    info!("DNS: {}.{} -> {}", service_name, namespace, vip);
-
-    // Build and send the response
-    let response = query.build_response(vip);
-    Ok(Some(response.to_vec()))
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 
 mod dns;
 mod dns_intercept;
+mod dns_resolver;
 mod k8s;
 mod pipe;
 mod stack;
@@ -21,9 +22,10 @@ use tracing_subscriber::FmtSubscriber;
 
 use dns::DnsHandler;
 use dns_intercept::DnsInterceptor;
+use dns_resolver::{DnsResolver, DnsResolverConfig};
 use k8s::K8sClient;
 use pipe::pipe;
-use stack::{DnsForwardConfig, NetworkStack};
+use stack::NetworkStack;
 use tun::{TunConfig, TunDevice};
 use vip::{ServiceId, VipManager};
 
@@ -203,7 +205,7 @@ async fn main() -> Result<()> {
 
     // Set up DNS interception if enabled
     let mut dns_interceptor: Option<DnsInterceptor> = None;
-    let dns_forward_config: Option<DnsForwardConfig> = if args.intercept_dns {
+    let dns_resolver: Option<Arc<DnsResolver>> = if args.intercept_dns {
         info!("Setting up DNS interception...");
         match DnsInterceptor::new(tun_name.clone()) {
             Ok(mut interceptor) => match interceptor.enable() {
@@ -213,12 +215,32 @@ async fn main() -> Result<()> {
                         interceptor.system_dns(),
                         interceptor.bind_interface()
                     );
-                    let config = DnsForwardConfig {
-                        system_dns: interceptor.system_dns(),
+
+                    // Create the DNS resolver with upstream configuration
+                    let resolver_config = DnsResolverConfig {
+                        upstream_dns: interceptor.system_dns(),
                         bind_interface: interceptor.bind_interface().to_string(),
                     };
-                    dns_interceptor = Some(interceptor);
-                    Some(config)
+
+                    match DnsResolver::new(
+                        resolver_config,
+                        Arc::clone(&dns_handler),
+                        Arc::clone(&vip_manager),
+                    )
+                    .await
+                    {
+                        Ok(resolver) => {
+                            dns_interceptor = Some(interceptor);
+                            Some(Arc::new(resolver))
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to create DNS resolver: {}. Continuing without it.",
+                                e
+                            );
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -242,15 +264,10 @@ async fn main() -> Result<()> {
 
     info!("Initializing userspace network stack...");
 
-    // Initialize network stack with optional DNS forwarding
-    let mut network_stack = NetworkStack::with_dns_forward(
-        async_device,
-        Arc::clone(&vip_manager),
-        Arc::clone(&dns_handler),
-        dns_forward_config,
-    )
-    .await
-    .context("Failed to initialize network stack")?;
+    // Initialize network stack with optional DNS resolver
+    let mut network_stack = NetworkStack::new(async_device, Arc::clone(&vip_manager), dns_resolver)
+        .await
+        .context("Failed to initialize network stack")?;
 
     info!("Network stack initialized");
     info!("");

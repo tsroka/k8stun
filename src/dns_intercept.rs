@@ -3,19 +3,13 @@
 //! This module handles intercepting DNS traffic by:
 //! 1. Detecting the system's DNS server
 //! 2. Routing DNS server traffic through the TUN device
-//! 3. Forwarding non-K8s queries to the original DNS via the original interface
 
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
-use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::process::Command;
-use std::time::Duration;
 use tracing::{debug, info, warn};
-
-#[cfg(target_os = "macos")]
-use std::{ffi::CString, num::NonZeroU32};
 
 /// Configuration for DNS interception.
 #[derive(Debug, Clone)]
@@ -270,117 +264,6 @@ fn detect_default_interface_name() -> Result<String> {
 fn is_in_vip_range(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 198 && octets[1] == 18
-}
-
-/// Forwards a DNS query to an upstream DNS server and returns the response.
-///
-/// By binding to a specific network interface, this bypasses the TUN routing
-/// and sends the query through the original network interface.
-pub async fn forward_dns_query(
-    query: &[u8],
-    upstream_dns: Ipv4Addr,
-    bind_interface: &str,
-) -> Result<Vec<u8>> {
-    // Create a UDP socket bound to the specified interface
-    let socket = create_interface_bound_socket(bind_interface)?;
-
-    // Convert socket2::Socket to tokio::net::UdpSocket
-    socket.set_nonblocking(true)?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    let socket = tokio::net::UdpSocket::from_std(std_socket)
-        .context("Failed to convert to tokio UdpSocket")?;
-
-    let upstream_addr = SocketAddr::new(upstream_dns.into(), 53);
-
-    debug!(
-        "Forwarding DNS query via interface '{}' to {}",
-        bind_interface, upstream_addr
-    );
-
-    socket
-        .send_to(query, upstream_addr)
-        .await
-        .context("Failed to send DNS query to upstream")?;
-
-    // Set a timeout for the response
-    let mut buf = vec![0u8; 512];
-
-    let recv_future = socket.recv_from(&mut buf);
-    let result = tokio::time::timeout(Duration::from_secs(5), recv_future).await;
-
-    match result {
-        Ok(Ok((len, _))) => {
-            buf.truncate(len);
-            Ok(buf)
-        }
-        Ok(Err(e)) => Err(anyhow!("DNS recv error: {}", e)),
-        Err(_) => Err(anyhow!("DNS query timeout")),
-    }
-}
-
-/// Creates a UDP socket bound to a specific network interface.
-#[cfg(target_os = "linux")]
-fn create_interface_bound_socket(interface_name: &str) -> Result<Socket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("Failed to create UDP socket")?;
-
-    // On Linux, use SO_BINDTODEVICE (requires CAP_NET_RAW or root)
-    socket
-        .bind_device(Some(interface_name.as_bytes()))
-        .context(format!(
-            "Failed to bind socket to interface '{}' (may require root/CAP_NET_RAW)",
-            interface_name
-        ))?;
-
-    // Bind to any address on port 0 (ephemeral port)
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    socket
-        .bind(&bind_addr.into())
-        .context("Failed to bind socket to ephemeral port")?;
-
-    Ok(socket)
-}
-
-/// Creates a UDP socket bound to a specific network interface.
-#[cfg(target_os = "macos")]
-fn create_interface_bound_socket(interface_name: &str) -> Result<Socket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("Failed to create UDP socket")?;
-
-    // Convert interface name to index
-    let if_name =
-        CString::new(interface_name).context("Invalid interface name (contains null byte)")?;
-
-    let if_index = unsafe { libc::if_nametoindex(if_name.as_ptr()) };
-    if if_index == 0 {
-        return Err(anyhow!(
-            "Interface '{}' not found (if_nametoindex returned 0)",
-            interface_name
-        ));
-    }
-
-    // On macOS, use IP_BOUND_IF via socket2's bind_device_by_index
-    let if_index = NonZeroU32::new(if_index).ok_or_else(|| anyhow!("Interface index is zero"))?;
-
-    socket
-        .bind_device_by_index_v4(Some(if_index))
-        .context(format!(
-            "Failed to bind socket to interface '{}'",
-            interface_name
-        ))?;
-
-    debug!(
-        "Bound socket to interface '{}' (index {})",
-        interface_name, if_index
-    );
-
-    // Bind to any address on port 0 (ephemeral port)
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    socket
-        .bind(&bind_addr.into())
-        .context("Failed to bind socket to ephemeral port")?;
-
-    Ok(socket)
 }
 
 #[cfg(test)]
