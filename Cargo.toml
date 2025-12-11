@@ -46,7 +46,6 @@ thiserror = "1.0"
 
 # Lock-free data structures
 arc-swap = "1.7"
-dashmap = "6.1"
 
 # DNS protocol
 hickory-proto = "0.25"
@@ -55,6 +54,7 @@ hickory-resolver = "0.25"
 # Async utilities
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
+dashmap = "6.1.0"
 
 [profile.release]
 opt-level = 3

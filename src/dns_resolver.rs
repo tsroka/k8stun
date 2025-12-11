@@ -227,7 +227,7 @@ pub struct DnsResolver {
     /// Handler for K8s DNS logic.
     dns_handler: Arc<DnsHandler>,
     /// VIP manager for allocating virtual IPs.
-    vip_manager: Arc<VipManager>,
+    vip_manager: VipManager,
     /// Kubernetes client for validating resources.
     k8s_client: Arc<K8sClient>,
 }
@@ -237,7 +237,7 @@ impl DnsResolver {
     pub async fn new(
         config: DnsResolverConfig,
         dns_handler: Arc<DnsHandler>,
-        vip_manager: Arc<VipManager>,
+        vip_manager: VipManager,
         k8s_client: Arc<K8sClient>,
     ) -> Result<Self> {
         info!(
@@ -507,7 +507,7 @@ mod tests {
         };
 
         let dns_handler = Arc::new(DnsHandler::new(make_namespace_set(vec!["default"])));
-        let vip_manager = Arc::new(VipManager::new(Ipv4Addr::new(198, 18, 0, 0)));
+        let vip_manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
         let k8s_client = Arc::new(
             K8sClient::new(None)
                 .await

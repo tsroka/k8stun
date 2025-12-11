@@ -74,13 +74,16 @@ impl AsyncWrite for TcpStream {
 pub struct AcceptedConnection {
     pub stream: TcpStream,
     pub target: TargetId,
+    /// The destination VIP address.
+    pub vip: std::net::Ipv4Addr,
     /// The destination port from the intercepted connection.
     pub port: u16,
 }
 
 /// The userspace network stack that handles TCP connections.
 pub struct NetworkStack {
-    vip_manager: Arc<VipManager>,
+    #[allow(dead_code)]
+    vip_manager: VipManager,
     /// Channel to receive accepted TCP connections.
     connection_rx: mpsc::Receiver<AcceptedConnection>,
 }
@@ -89,7 +92,7 @@ impl NetworkStack {
     /// Creates a new network stack using the given TUN device.
     pub async fn new(
         device: AsyncDevice,
-        vip_manager: Arc<VipManager>,
+        vip_manager: VipManager,
         dns_resolver: Option<Arc<DnsResolver>>,
     ) -> Result<Self> {
         let (connection_tx, connection_rx) = mpsc::channel(64);
@@ -102,7 +105,7 @@ impl NetworkStack {
         tokio::spawn(run_tun_stack_bridge(device, stack));
 
         // Spawn the TCP connection handling task
-        let vip_manager_clone = Arc::clone(&vip_manager);
+        let vip_manager_clone = vip_manager.clone();
         tokio::spawn(async move {
             if let Err(e) = run_tcp_listener(tcp_listener, vip_manager_clone, connection_tx).await {
                 error!("TCP listener error: {}", e);
@@ -198,7 +201,7 @@ async fn run_tun_stack_bridge(device: AsyncDevice, stack: NetStack) {
 /// Main loop that accepts TCP connections from the TCP listener.
 async fn run_tcp_listener(
     mut tcp_listener: TcpListener,
-    vip_manager: Arc<VipManager>,
+    vip_manager: VipManager,
     connection_tx: mpsc::Sender<AcceptedConnection>,
 ) -> Result<()> {
     // TcpListener is a Stream that yields (TcpStream, local_addr, remote_addr)
@@ -246,6 +249,7 @@ async fn run_tcp_listener(
         let connection = AcceptedConnection {
             stream,
             target,
+            vip: dst_ip,
             port: dst_port,
         };
 

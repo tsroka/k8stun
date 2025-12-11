@@ -26,8 +26,9 @@ use dns_resolver::{DnsResolver, DnsResolverConfig};
 use k8s::{K8sClient, PodEndpoint};
 use pipe::pipe;
 use stack::NetworkStack;
+use std::time::Duration;
 use tun::{TunConfig, TunDevice};
-use vip::{PodId, ServiceId, TargetId, VipManager};
+use vip::{PodId, ServiceId, TargetId, VipManager, VipManagerConfig};
 
 /// Kubernetes Userspace Network Tunnel
 ///
@@ -82,6 +83,10 @@ struct Args {
     /// Kubernetes context to use (from kubeconfig). If not specified, uses current context.
     #[arg(short = 'c', long)]
     context: Option<String>,
+
+    /// Stale VIP timeout in seconds (VIPs without connections are removed after this time)
+    #[arg(long, default_value = "600")]
+    stale_vip_timeout: u64,
 }
 
 #[tokio::main]
@@ -130,8 +135,12 @@ async fn main() -> Result<()> {
     namespace_watcher.start();
     let namespace_set = namespace_watcher.namespace_set();
 
-    // Initialize VIP manager
-    let vip_manager = Arc::new(VipManager::new(args.vip_base));
+    // Initialize VIP manager with stale timeout configuration
+    let vip_manager = VipManager::with_config(VipManagerConfig {
+        base_ip: args.vip_base,
+        stale_timeout: Duration::from_secs(args.stale_vip_timeout),
+        cleanup_interval: Duration::from_secs(60),
+    });
 
     // Initialize DNS handler with dynamic namespace set
     let dns_handler = Arc::new(DnsHandler::new(namespace_set));
@@ -232,7 +241,7 @@ async fn main() -> Result<()> {
                     match DnsResolver::new(
                         resolver_config,
                         Arc::clone(&dns_handler),
-                        Arc::clone(&vip_manager),
+                        vip_manager.clone(),
                         Arc::clone(&k8s_client),
                     )
                     .await
@@ -273,7 +282,7 @@ async fn main() -> Result<()> {
     info!("Initializing userspace network stack...");
 
     // Initialize network stack with optional DNS resolver
-    let mut network_stack = NetworkStack::new(async_device, Arc::clone(&vip_manager), dns_resolver)
+    let mut network_stack = NetworkStack::new(async_device, vip_manager.clone(), dns_resolver)
         .await
         .context("Failed to initialize network stack")?;
 
@@ -325,8 +334,10 @@ async fn main() -> Result<()> {
             Some(connection) = network_stack.accept() => {
                 let target = connection.target;
                 let stream = connection.stream;
+                let vip = connection.vip;
                 let port = connection.port;
                 let k8s = Arc::clone(&k8s_client);
+                let vip_mgr = vip_manager.clone();
 
                 info!(
                     "New connection to {}.{}:{} from {}",
@@ -335,6 +346,15 @@ async fn main() -> Result<()> {
 
                 // Spawn a task to handle the connection
                 tokio::spawn(async move {
+                    // Register the connection with VipManager to track it
+                    // The guard will automatically unregister when dropped
+                    let _active_conn = match vip_mgr.register_connection(vip).await {
+                        Some(guard) => guard,
+                        None => {
+                            error!("Failed to register connection for VIP {}", vip);
+                            return;
+                        }
+                    };
 
                     // Get a pod endpoint based on target type
                     let (endpoint, label) = match &target {
@@ -396,32 +416,43 @@ async fn main() -> Result<()> {
 
                     let result = pipe(stream, k8s_stream).await;
 
+                    // Update byte counters on the active connection before logging
+                    let update_stats = |stats: &pipe::PipeStats| {
+                        _active_conn.add_bytes_sent(stats.bytes_to_server.load(std::sync::atomic::Ordering::Relaxed));
+                        _active_conn.add_bytes_received(stats.bytes_to_client.load(std::sync::atomic::Ordering::Relaxed));
+                    };
+
                     match result {
                         pipe::PipeResult::Completed { stats } => {
+                            update_stats(&stats);
                             info!(
                                 "Connection completed: {} ({} bytes)",
                                 label, stats.total_bytes()
                             );
                         }
                         pipe::PipeResult::ClientClosed { stats } => {
+                            update_stats(&stats);
                             info!(
                                 "Client closed: {} ({} bytes)",
                                 label, stats.total_bytes()
                             );
                         }
                         pipe::PipeResult::ServerClosed { stats } => {
+                            update_stats(&stats);
                             info!(
                                 "Server closed: {} ({} bytes)",
                                 label, stats.total_bytes()
                             );
                         }
                         pipe::PipeResult::Error { error, stats } => {
+                            update_stats(&stats);
                             warn!(
                                 "Connection error: {} - {} ({} bytes)",
                                 label, error, stats.total_bytes()
                             );
                         }
                     }
+                    // _active_conn is dropped here, automatically unregistering the connection
                 });
             }
 
