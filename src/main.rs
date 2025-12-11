@@ -4,6 +4,7 @@
 //! a Kubernetes cluster, allowing you to access internal Kubernetes services
 //! from your local browser or terminal as if you were inside the cluster.
 
+mod api;
 mod dns;
 mod dns_intercept;
 mod dns_resolver;
@@ -87,6 +88,10 @@ struct Args {
     /// Stale VIP timeout in seconds (VIPs without connections are removed after this time)
     #[arg(long, default_value = "600")]
     stale_vip_timeout: u64,
+
+    /// Port for the HTTP API server (0 to disable)
+    #[arg(long, default_value = "0")]
+    http: u16,
 }
 
 #[tokio::main]
@@ -287,6 +292,18 @@ async fn main() -> Result<()> {
         .context("Failed to initialize network stack")?;
 
     info!("Network stack initialized");
+
+    // Start API server if enabled
+    if args.http > 0 {
+        let api_vip_manager = vip_manager.clone();
+        let http_port = args.http;
+        tokio::spawn(async move {
+            if let Err(e) = api::start_server(http_port, api_vip_manager).await {
+                error!("API server error: {}", e);
+            }
+        });
+    }
+
     info!("");
     info!("===========================================");
     info!("k8stun is ready!");
@@ -317,6 +334,13 @@ async fn main() -> Result<()> {
         info!("");
         info!("DNS interception is OFF. Use --intercept-dns to enable.");
         info!("Without it, use the VIP addresses directly.");
+    }
+
+    if args.http > 0 {
+        info!("");
+        info!("API server available at:");
+        info!("  GET  http://localhost:{}/vips    - Current VIP mappings", args.http);
+        info!("  GET  http://localhost:{}/events  - Real-time updates (SSE)", args.http);
     }
 
     info!("");

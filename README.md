@@ -93,6 +93,7 @@ Options:
   -l, --log-level <LOG_LEVEL>    Log level (trace, debug, info, warn, error) [default: info]
       --mtu <MTU>                MTU for the TUN device [default: 1500]
       --idle-timeout <SECONDS>   Idle connection timeout in seconds (0 = no timeout) [default: 300]
+      --http <PORT>              Port for the HTTP API server (0 to disable) [default: 0]
   -h, --help                     Print help
   -V, --version                  Print version
 ```
@@ -178,6 +179,55 @@ This is particularly useful for:
 - Debugging individual pods
 - Testing pod-to-pod communication patterns
 
+## HTTP API
+
+k8stun can optionally expose an HTTP API for monitoring VIP allocations and connections. Enable it with `--http <port>`:
+
+```bash
+sudo k8stun --http 8080
+```
+
+### Endpoints
+
+#### GET /vips
+
+Returns a JSON snapshot of all current VIP mappings:
+
+```bash
+curl http://localhost:8080/vips
+```
+
+```json
+{
+  "vips": [
+    {
+      "vip": "198.18.0.2",
+      "target": { "type": "service", "name": "backend", "namespace": "default" },
+      "stats": {
+        "active_connections": 2,
+        "total_connections": 15,
+        "bytes_sent": 12345,
+        "bytes_received": 67890
+      }
+    }
+  ]
+}
+```
+
+#### GET /events
+
+Server-Sent Events (SSE) endpoint for real-time updates. The first message is a snapshot of all VIPs, followed by delta updates as changes occur:
+
+```bash
+curl http://localhost:8080/events
+```
+
+Events include:
+- `snapshot` - Initial state with all VIPs
+- `vip_allocated` - A new VIP was assigned
+- `vip_removed` - A VIP was deallocated (stale cleanup)
+- `connection_changed` - Connection count changed
+
 ## Requirements
 
 - Rust 1.70+ (for building)
@@ -197,7 +247,11 @@ src/
 ├── dns_intercept.rs - DNS query interception setup
 ├── stack.rs         - Userspace TCP/IP stack (lwIP)
 ├── k8s.rs           - Kubernetes client, pod lookup, and port-forwarding
-└── pipe.rs          - Bidirectional stream copying
+├── pipe.rs          - Bidirectional stream copying
+└── api/             - HTTP API server (optional)
+    ├── mod.rs       - Server setup and routing
+    ├── handlers.rs  - Route handlers (GET /vips, SSE /events)
+    └── types.rs     - API response types
 ```
 
 ## Dependencies

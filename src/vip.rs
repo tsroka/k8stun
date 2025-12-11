@@ -8,13 +8,14 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
+use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, trace};
 
 // ============================================================================
@@ -26,7 +27,7 @@ use tracing::{debug, info, trace};
 /// Note: Port is intentionally not included here. A service gets the same VIP
 /// regardless of which port you connect to. The port is determined at connection
 /// time from the TCP destination port.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ServiceId {
     /// The service name.
     pub name: String,
@@ -39,7 +40,7 @@ pub struct ServiceId {
 /// Note: Port is intentionally not included here. A pod gets the same VIP
 /// regardless of which port you connect to. The port is determined at connection
 /// time from the TCP destination port.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct PodId {
     /// The pod name.
     pub name: String,
@@ -62,7 +63,8 @@ impl PodId {
 }
 
 /// Unified target identifier that can be either a service or a pod.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum TargetId {
     Service(ServiceId),
     Pod(PodId),
@@ -208,12 +210,39 @@ impl Default for VipStats {
 }
 
 /// A point-in-time snapshot of VIP statistics.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct VipStatsSnapshot {
     pub active_connections: u32,
     pub total_connections: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+}
+
+// ============================================================================
+// VIP Update Events (for real-time notifications)
+// ============================================================================
+
+/// Represents a state change in the VIP manager.
+/// These events are broadcast to subscribers for real-time updates.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum VipUpdate {
+    /// A new VIP was allocated for a target.
+    VipAllocated {
+        vip: Ipv4Addr,
+        target: TargetId,
+    },
+    /// A VIP was removed (due to stale cleanup).
+    VipRemoved {
+        vip: Ipv4Addr,
+        target: TargetId,
+    },
+    /// Connection count changed for a VIP.
+    ConnectionChanged {
+        vip: Ipv4Addr,
+        active_connections: u32,
+        total_connections: u64,
+    },
 }
 
 // ============================================================================
@@ -373,6 +402,9 @@ struct VipManagerActor {
     /// Sender clone for ActiveConnection guards.
     sender: mpsc::Sender<VipMessage>,
 
+    /// Broadcast sender for real-time updates.
+    update_tx: broadcast::Sender<VipUpdate>,
+
     /// Stale timeout duration.
     stale_timeout: Duration,
 
@@ -497,6 +529,12 @@ impl VipManagerActor {
             vip,
         });
 
+        // Broadcast the allocation
+        let _ = self.update_tx.send(VipUpdate::VipAllocated {
+            vip,
+            target: target.clone(),
+        });
+
         info!("Allocated VIP {} for {:?}", vip, target);
         Ok(vip)
     }
@@ -524,30 +562,39 @@ impl VipManagerActor {
         self.next_conn_id += 1;
 
         let now = Instant::now();
-        let stats = {
+        let (stats, active, total) = {
             let entry = self.vip_entries.get_mut(&vip)?;
 
             // Update stats
-            entry
+            let active = entry
                 .stats
                 .active_connections
-                .fetch_add(1, Ordering::Relaxed);
-            entry
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let total = entry
                 .stats
                 .total_connections
-                .fetch_add(1, Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
 
             // Track connection
             entry.active_connections.insert(conn_id.clone());
             entry.last_activity = now;
 
-            Arc::clone(&entry.stats)
+            (Arc::clone(&entry.stats), active, total)
         };
 
         // Push to heap after releasing borrow
         self.stale_heap.push(HeapEntry {
             last_activity: Reverse(now),
             vip,
+        });
+
+        // Broadcast the connection change
+        let _ = self.update_tx.send(VipUpdate::ConnectionChanged {
+            vip,
+            active_connections: active,
+            total_connections: total,
         });
 
         debug!("Registered connection {:?} for VIP {}", conn_id, vip);
@@ -557,21 +604,30 @@ impl VipManagerActor {
 
     fn handle_connection_closed(&mut self, vip: Ipv4Addr, conn_id: ConnectionId) {
         let now = Instant::now();
-        let active_count = {
+        let connection_info = {
             if let Some(entry) = self.vip_entries.get_mut(&vip) {
                 entry.active_connections.remove(&conn_id);
                 entry.last_activity = now;
-                Some(entry.active_connections.len())
+                let active = entry.stats.active_connections.load(Ordering::Relaxed);
+                let total = entry.stats.total_connections.load(Ordering::Relaxed);
+                Some((entry.active_connections.len(), active, total))
             } else {
                 None
             }
         };
 
-        if let Some(count) = active_count {
+        if let Some((count, active, total)) = connection_info {
             // Push to heap after releasing borrow
             self.stale_heap.push(HeapEntry {
                 last_activity: Reverse(now),
                 vip,
+            });
+
+            // Broadcast the connection change
+            let _ = self.update_tx.send(VipUpdate::ConnectionChanged {
+                vip,
+                active_connections: active,
+                total_connections: total,
             });
 
             debug!(
@@ -626,6 +682,12 @@ impl VipManagerActor {
             // Recycle the VIP
             self.free_vips.push(vip);
 
+            // Broadcast the removal
+            let _ = self.update_tx.send(VipUpdate::VipRemoved {
+                vip,
+                target: target.clone(),
+            });
+
             removed_count += 1;
             info!(
                 "Removed stale VIP {} for {:?} (idle {:?})",
@@ -670,6 +732,7 @@ impl Default for VipManagerConfig {
 #[derive(Clone)]
 pub struct VipManager {
     sender: mpsc::Sender<VipMessage>,
+    update_tx: broadcast::Sender<VipUpdate>,
     base_ip: Ipv4Addr,
     max_ips: u32,
 }
@@ -695,6 +758,7 @@ impl VipManager {
     /// Creates a new VIP manager with full configuration.
     pub fn with_config(config: VipManagerConfig) -> Self {
         let (sender, receiver) = mpsc::channel(256);
+        let (update_tx, _) = broadcast::channel(256);
 
         let actor = VipManagerActor {
             base_ip: config.base_ip,
@@ -707,6 +771,7 @@ impl VipManager {
             next_conn_id: 1,
             receiver,
             sender: sender.clone(),
+            update_tx: update_tx.clone(),
             stale_timeout: config.stale_timeout,
             cleanup_interval: config.cleanup_interval,
         };
@@ -719,6 +784,7 @@ impl VipManager {
 
         Self {
             sender,
+            update_tx,
             base_ip: config.base_ip,
             max_ips: 65534,
         }
@@ -859,6 +925,14 @@ impl VipManager {
             self.get_or_allocate_vip(service).await?;
         }
         Ok(())
+    }
+
+    /// Subscribes to real-time VIP updates.
+    ///
+    /// Returns a broadcast receiver that will receive `VipUpdate` events
+    /// whenever the VIP state changes (allocations, removals, connection changes).
+    pub fn subscribe(&self) -> broadcast::Receiver<VipUpdate> {
+        self.update_tx.subscribe()
     }
 }
 
