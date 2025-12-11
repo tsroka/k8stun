@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
 
 use dns::DnsHandler;
 use dns_intercept::DnsInterceptor;
@@ -53,9 +53,17 @@ struct Args {
     #[arg(short, long)]
     services: Vec<String>,
 
-    /// Log level (trace, debug, info, warn, error)
+    /// Log level for k8stun (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// Log level for libraries (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info")]
+    lib_log_level: String,
+
+    /// Show source file and line number in log messages
+    #[arg(long, default_value = "false")]
+    log_source: bool,
 
     /// MTU for the TUN device
     #[arg(long, default_value = "1500")]
@@ -80,22 +88,19 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
-    let log_level = match args.log_level.to_lowercase().as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
-    };
+    // Initialize logging with separate levels for app and libraries
+    let app_level = args.log_level.to_lowercase();
+    let lib_level = args.lib_log_level.to_lowercase();
 
-    FmtSubscriber::builder()
-        .with_max_level(log_level)
+    // Build filter: k8stun at app_level, everything else at lib_level
+    let filter = EnvFilter::new(format!("{lib_level},k8stun={app_level}"));
+
+    fmt::Subscriber::builder()
+        .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
-        .with_file(false)
-        .with_line_number(false)
+        .with_file(args.log_source)
+        .with_line_number(args.log_source)
         .compact()
         .init();
 

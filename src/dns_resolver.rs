@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::dns::{DnsHandler, DnsQuery, PodDnsInfo};
 use crate::vip::{PodId, ServiceId, VipManager};
@@ -297,7 +297,7 @@ impl DnsResolver {
 
         // Check if we should intercept this query (K8s service or pod)
         if !self.dns_handler.should_intercept(&query) {
-            debug!("Not intercepting DNS query for {:?}", query_names);
+            trace!("Not intercepting DNS query for {:?}", query_names);
             return self.forward_query(&query, &query_names).await;
         }
 
