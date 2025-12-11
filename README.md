@@ -33,7 +33,7 @@ A transparent network tunnel that connects your local machine directly to a Kube
 ### macOS (Homebrew)
 
 ```bash
-brew install tsroka/k8stun
+brew install tsroka/k8stun/k8stun
 ```
 
 ### Debian/Ubuntu
