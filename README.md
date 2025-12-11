@@ -6,11 +6,12 @@ A transparent network tunnel that connects your local machine directly to a Kube
 
 ## Features
 
-- **Transparent Access**: Access Kubernetes services using their internal DNS names
+- **Transparent Access**: Access Kubernetes services and pods using their internal DNS names
 - **No /etc/hosts Modifications**: Works at the network layer (Layer 3), no messy host file edits
 - **No Kernel Modules**: Operates entirely in userspace using a TUN device
 - **Automatic Service Discovery**: Discovers and exposes services from specified namespaces
-- **DNS Interception**: Automatically resolves Kubernetes service names to virtual IPs
+- **DNS Interception**: Automatically resolves Kubernetes service and pod names to virtual IPs
+- **Direct Pod Access**: Connect to individual pods using Kubernetes pod DNS patterns
 - **Bidirectional Streaming**: Full TCP support with proper connection handling
 
 ## How It Works
@@ -22,7 +23,7 @@ A transparent network tunnel that connects your local machine directly to a Kube
 └─────────────────────┘     └──────────────────────────────────┘     └─────────────┘
 ```
 
-1. **DNS Hijack**: When you access `backend.default`, the DNS query is intercepted
+1. **DNS Hijack**: When you access `backend.default` or `mysql-0.mysql.default`, the DNS query is intercepted
 2. **VIP Allocation**: A virtual IP (e.g., `198.18.0.5`) is assigned and returned
 3. **Routing**: Traffic to the VIP range is captured by the TUN device
 4. **Userspace TCP**: The `lwip` library terminates TCP connections in userspace
@@ -129,12 +130,53 @@ Press Ctrl+C to stop.
 
 In another terminal:
 ```bash
+# Access services by name
 $ curl http://backend.default/api/health
 {"status": "ok"}
 
 $ curl http://api.production:8080/users
 [{"id": 1, "name": "Alice"}, ...]
+
+# Access individual pods directly (StatefulSet)
+$ curl http://mysql-0.mysql.default:3306/
+$ curl http://redis-0.redis.cache:6379/
+
+# Access pods by IP
+$ curl http://172-17-0-3.default.pod:8080/
 ```
+
+## Supported DNS Patterns
+
+k8stun supports the standard Kubernetes DNS naming conventions:
+
+### Service DNS
+
+```bash
+# Short form (requires namespace to be known)
+curl http://my-service.default/
+
+# Full form
+curl http://my-service.default.svc.cluster.local/
+```
+
+### Pod DNS
+
+Connect directly to individual pods using Kubernetes pod DNS patterns:
+
+```bash
+# StatefulSet pods (pod-name.service-name.namespace)
+curl http://mysql-0.mysql.default/
+curl http://redis-0.redis.cache.svc.cluster.local/
+
+# Pod by IP address (ip-with-dashes.namespace.pod)
+curl http://172-17-0-3.default.pod.cluster.local/
+curl http://10-0-0-5.production.pod/
+```
+
+This is particularly useful for:
+- Connecting to specific replicas of a StatefulSet (e.g., MySQL primary vs replica)
+- Debugging individual pods
+- Testing pod-to-pod communication patterns
 
 ## Requirements
 
@@ -149,11 +191,12 @@ $ curl http://api.production:8080/users
 src/
 ├── main.rs          - Entry point, CLI, orchestration
 ├── tun.rs           - TUN device creation and OS routing
-├── vip.rs           - Virtual IP pool management
-├── dns.rs           - DNS packet parsing and response building
-├── dns_intercept.rs - DNS query interception and resolution
+├── vip.rs           - Virtual IP pool management (services & pods)
+├── dns.rs           - DNS packet parsing for services and pods
+├── dns_resolver.rs  - DNS resolution with upstream forwarding
+├── dns_intercept.rs - DNS query interception setup
 ├── stack.rs         - Userspace TCP/IP stack (lwIP)
-├── k8s.rs           - Kubernetes client and port-forwarding
+├── k8s.rs           - Kubernetes client, pod lookup, and port-forwarding
 └── pipe.rs          - Bidirectional stream copying
 ```
 

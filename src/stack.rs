@@ -16,7 +16,7 @@ use tracing::{debug, error, info, trace, warn};
 use tun2::AsyncDevice;
 
 use crate::dns_resolver::DnsResolver;
-use crate::vip::{ServiceId, VipManager};
+use crate::vip::{TargetId, VipManager};
 
 /// A TCP stream from the userspace stack.
 pub struct TcpStream {
@@ -72,7 +72,7 @@ impl AsyncWrite for TcpStream {
 /// Information about an accepted TCP connection.
 pub struct AcceptedConnection {
     pub stream: TcpStream,
-    pub service: ServiceId,
+    pub target: TargetId,
 }
 
 /// The userspace network stack that handles TCP connections.
@@ -202,7 +202,7 @@ async fn run_tcp_listener(
     while let Some((tcp_stream, local_addr, peer_addr)) = tcp_listener.next().await {
         debug!("TCP connection: {} -> {}", local_addr, peer_addr);
 
-        // Look up the service for this VIP
+        // Look up the target for this VIP
         let dst_ip = match peer_addr {
             SocketAddr::V4(addr) => *addr.ip(),
             SocketAddr::V6(_) => {
@@ -223,15 +223,20 @@ async fn run_tcp_listener(
             continue;
         }
 
-        // Look up the service
-        let service = match vip_manager.lookup_service(dst_ip).await {
-            Some(mut svc) => {
+        // Look up the target (service or pod)
+        let target = match vip_manager.lookup_target(dst_ip).await {
+            Some(TargetId::Service(mut svc)) => {
                 // Update the port to the connection port
                 svc.port = dst_port;
-                svc
+                TargetId::Service(svc)
+            }
+            Some(TargetId::Pod(mut pod)) => {
+                // Update the port to the connection port
+                pod.port = dst_port;
+                TargetId::Pod(pod)
             }
             None => {
-                warn!("No service found for VIP {}, refusing connection", dst_ip);
+                warn!("No target found for VIP {}, refusing connection", dst_ip);
                 // lwip's TcpStream sends RST on drop if not closed, so just drop it
                 drop(tcp_stream);
                 continue;
@@ -244,7 +249,7 @@ async fn run_tcp_listener(
             peer_addr,
         };
 
-        let connection = AcceptedConnection { stream, service };
+        let connection = AcceptedConnection { stream, target };
 
         if let Err(e) = connection_tx.send(connection).await {
             error!("Failed to send connection to handler: {}", e);
@@ -289,6 +294,7 @@ async fn run_udp_handler(udp_socket: Box<UdpSocket>, dns_resolver: Arc<DnsResolv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vip::ServiceId;
 
     #[test]
     fn test_service_id_creation() {
@@ -296,5 +302,18 @@ mod tests {
         assert_eq!(service.name, "backend");
         assert_eq!(service.namespace, "default");
         assert_eq!(service.port, 8080);
+    }
+
+    #[test]
+    fn test_target_id() {
+        use crate::vip::PodId;
+
+        let svc_target = TargetId::Service(ServiceId::new("backend", "default", 80));
+        assert!(svc_target.is_service());
+        assert!(!svc_target.is_pod());
+
+        let pod_target = TargetId::Pod(PodId::new("mysql-0", "default", 3306));
+        assert!(pod_target.is_pod());
+        assert!(!pod_target.is_service());
     }
 }

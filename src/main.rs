@@ -23,11 +23,11 @@ use tracing_subscriber::FmtSubscriber;
 use dns::DnsHandler;
 use dns_intercept::DnsInterceptor;
 use dns_resolver::{DnsResolver, DnsResolverConfig};
-use k8s::K8sClient;
+use k8s::{K8sClient, PodEndpoint};
 use pipe::pipe;
 use stack::NetworkStack;
 use tun::{TunConfig, TunDevice};
-use vip::{ServiceId, VipManager};
+use vip::{PodId, ServiceId, TargetId, VipManager};
 
 /// Kubernetes Userspace Network Tunnel
 ///
@@ -290,9 +290,13 @@ async fn main() -> Result<()> {
 
     if dns_interceptor.is_some() {
         info!("");
-        info!("DNS interception is ACTIVE. You can use service names directly:");
+        info!("DNS interception is ACTIVE. You can use service and pod names directly:");
         info!("  curl http://backend.default/");
         info!("  curl http://api.production:8080/");
+        info!("");
+        info!("Pod DNS patterns supported:");
+        info!("  curl http://mysql-0.mysql.default/             # StatefulSet pod");
+        info!("  curl http://172-17-0-3.default.pod/            # Pod by IP");
     } else {
         info!("");
         info!("DNS interception is OFF. Use --intercept-dns to enable.");
@@ -312,26 +316,58 @@ async fn main() -> Result<()> {
         tokio::select! {
             // Handle new TCP connections
             Some(connection) = network_stack.accept() => {
-                let service = connection.service;
+                let target = connection.target;
                 let stream = connection.stream;
                 let k8s = Arc::clone(&k8s_client);
 
                 info!(
                     "New connection to {}.{}:{} from {}",
-                    service.name, service.namespace, service.port, stream.peer_addr
+                    target.name(), target.namespace(), target.port(), stream.peer_addr
                 );
 
                 // Spawn a task to handle the connection
                 tokio::spawn(async move {
-                    // Get a pod endpoint for this service
-                    let endpoint = match k8s.get_next_endpoint(&service).await {
-                        Ok(ep) => ep,
-                        Err(e) => {
-                            error!(
-                                "Failed to get endpoint for {}.{}: {}",
-                                service.name, service.namespace, e
-                            );
-                            return;
+                    // Get a pod endpoint based on target type
+                    let (endpoint, label) = match &target {
+                        TargetId::Service(service) => {
+                            // For services, use endpoint discovery with load balancing
+                            match k8s.get_next_endpoint(service).await {
+                                Ok(ep) => {
+                                    let label = format!(
+                                        "{}.{}:{} -> {}/{}:{}",
+                                        service.name, service.namespace, service.port,
+                                        ep.namespace, ep.name, ep.port
+                                    );
+                                    (ep, label)
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to get endpoint for {}.{}: {}",
+                                        service.name, service.namespace, e
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        TargetId::Pod(pod) => {
+                            // For pods, connect directly
+                            match get_pod_endpoint(&k8s, pod).await {
+                                Ok(ep) => {
+                                    let label = format!(
+                                        "pod:{}.{}:{} -> {}/{}:{}",
+                                        pod.name, pod.namespace, pod.port,
+                                        ep.namespace, ep.name, ep.port
+                                    );
+                                    (ep, label)
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to get pod endpoint for {}.{}: {}",
+                                        pod.name, pod.namespace, e
+                                    );
+                                    return;
+                                }
+                            }
                         }
                     };
 
@@ -348,13 +384,6 @@ async fn main() -> Result<()> {
                             return;
                         }
                     };
-
-                    // Pipe data between the streams
-                    let label = format!(
-                        "{}.{}:{} -> {}/{}:{}",
-                        service.name, service.namespace, service.port,
-                        endpoint.namespace, endpoint.name, endpoint.port
-                    );
 
                     let result = pipe(stream, k8s_stream).await;
 
@@ -405,4 +434,46 @@ async fn main() -> Result<()> {
 
     info!("k8stun stopped");
     Ok(())
+}
+
+/// Gets a pod endpoint based on the PodId.
+///
+/// The pod name in PodId can be:
+/// - An actual pod name (for StatefulSet pods like "mysql-0")
+/// - A dashed IP address (for IP-based DNS like "172-17-0-3")
+/// - A hostname.subdomain combination (for hostname-based DNS)
+async fn get_pod_endpoint(k8s: &K8sClient, pod: &PodId) -> anyhow::Result<PodEndpoint> {
+    // Check if the pod name looks like a dashed IP address (e.g., "172-17-0-3")
+    if is_dashed_ip(&pod.name) {
+        // Convert dashed IP back to dotted format
+        let ip = pod.name.replace('-', ".");
+        return k8s.get_pod_by_ip(&ip, &pod.namespace, pod.port).await;
+    }
+
+    // Check if the pod name contains a dot (hostname.subdomain format)
+    if let Some((hostname, subdomain)) = pod.name.split_once('.') {
+        // Try to find by hostname and subdomain first
+        match k8s
+            .get_pod_by_hostname(hostname, subdomain, &pod.namespace, pod.port)
+            .await
+        {
+            Ok(ep) => return Ok(ep),
+            Err(_) => {
+                // If not found, try by name (the pod might just have a dotted name)
+            }
+        }
+    }
+
+    // Otherwise, look up by pod name directly
+    k8s.get_pod_by_name(&pod.name, &pod.namespace, pod.port)
+        .await
+}
+
+/// Checks if a string looks like a dashed IP address (e.g., "172-17-0-3").
+fn is_dashed_ip(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts.iter().all(|p| p.parse::<u8>().is_ok())
 }

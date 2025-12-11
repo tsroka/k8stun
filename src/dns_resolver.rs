@@ -1,7 +1,7 @@
 //! DNS resolver module using hickory-resolver.
 //!
 //! This module provides a DNS resolver that:
-//! - Resolves Kubernetes service names to VIPs
+//! - Resolves Kubernetes service and pod names to VIPs
 //! - Forwards non-K8s queries to upstream DNS servers
 //! - Uses interface-bound sockets to bypass TUN routing
 
@@ -25,8 +25,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::dns::{DnsHandler, DnsQuery};
-use crate::vip::{ServiceId, VipManager};
+use crate::dns::{DnsHandler, DnsQuery, PodDnsInfo};
+use crate::vip::{PodId, ServiceId, VipManager};
 
 #[cfg(target_os = "macos")]
 use std::{ffi::CString, num::NonZeroU32};
@@ -119,13 +119,14 @@ fn bind_socket_to_interface(socket: &Socket, interface_name: &str) -> io::Result
         ));
     }
 
-    let if_index = NonZeroU32::new(if_index)
-        .ok_or_else(|| io::Error::other("Interface index is zero"))?;
+    let if_index =
+        NonZeroU32::new(if_index).ok_or_else(|| io::Error::other("Interface index is zero"))?;
 
     socket.bind_device_by_index_v4(Some(if_index)).map_err(|e| {
-        io::Error::other(
-            format!("Failed to bind to interface '{}': {}", interface_name, e),
-        )
+        io::Error::other(format!(
+            "Failed to bind to interface '{}': {}",
+            interface_name, e
+        ))
     })
 }
 
@@ -274,7 +275,7 @@ impl DnsResolver {
 
     /// Resolves a DNS query and returns the response bytes.
     ///
-    /// If the query is for a K8s service, returns a VIP.
+    /// If the query is for a K8s service or pod, returns a VIP.
     /// Otherwise, forwards to the upstream DNS server.
     pub async fn resolve(&self, dns_data: &[u8]) -> Result<Option<Vec<u8>>> {
         if dns_data.is_empty() {
@@ -294,10 +295,15 @@ impl DnsResolver {
         let query_names: Vec<_> = query.questions().iter().map(|q| q.name.clone()).collect();
         debug!("DNS query for: {:?}", query_names);
 
-        // Check if we should intercept this query (K8s service)
+        // Check if we should intercept this query (K8s service or pod)
         if !self.dns_handler.should_intercept(&query) {
             debug!("Not intercepting DNS query for {:?}", query_names);
             return self.forward_query(&query, &query_names).await;
+        }
+
+        // Check if this is a pod query first
+        if self.dns_handler.is_pod_query(&query) {
+            return self.resolve_pod_query(&query, &query_names).await;
         }
 
         // Extract service info and resolve to VIP
@@ -318,6 +324,67 @@ impl DnsResolver {
             .context("Failed to allocate VIP")?;
 
         info!("DNS: {}.{} -> {}", service_name, namespace, vip);
+
+        // Build and return the response
+        let response = query.build_response(vip);
+        Ok(Some(response.to_vec()))
+    }
+
+    /// Resolves a pod DNS query and returns the response bytes.
+    async fn resolve_pod_query(
+        &self,
+        query: &DnsQuery,
+        query_names: &[String],
+    ) -> Result<Option<Vec<u8>>> {
+        let pod_info = match self.dns_handler.extract_pod_info(query) {
+            Some(info) => info,
+            None => {
+                debug!("Could not extract pod info from query");
+                return self.forward_query(query, query_names).await;
+            }
+        };
+
+        // Create a PodId and allocate a VIP based on the pod info type
+        let (pod_id, log_name) = match &pod_info {
+            PodDnsInfo::Ip { ip, namespace } => {
+                // For IP-based queries, use the IP as the pod name
+                // The actual pod lookup will happen when the connection is made
+                let pod_name = ip.to_string().replace('.', "-");
+                (
+                    PodId::new(&pod_name, namespace, 80),
+                    format!("{}.{}.pod", ip, namespace),
+                )
+            }
+            PodDnsInfo::StatefulSet {
+                pod_name,
+                service,
+                namespace,
+            } => (
+                PodId::new(pod_name, namespace, 80),
+                format!("{}.{}.{}", pod_name, service, namespace),
+            ),
+            PodDnsInfo::Hostname {
+                hostname,
+                subdomain,
+                namespace,
+            } => {
+                // For hostname-based queries, combine hostname and subdomain as the pod identifier
+                let pod_name = format!("{}.{}", hostname, subdomain);
+                (
+                    PodId::new(&pod_name, namespace, 80),
+                    format!("{}.{}.{}", hostname, subdomain, namespace),
+                )
+            }
+        };
+
+        // Get or allocate a VIP for this pod
+        let vip = self
+            .vip_manager
+            .get_or_allocate_vip_for_pod(pod_id)
+            .await
+            .context("Failed to allocate VIP for pod")?;
+
+        info!("DNS (pod): {} -> {}", log_name, vip);
 
         // Build and return the response
         let response = query.build_response(vip);

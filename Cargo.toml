@@ -46,6 +46,7 @@ thiserror = "1.0"
 
 # Lock-free data structures
 arc-swap = "1.7"
+dashmap = "6.1"
 
 # DNS protocol
 hickory-proto = "0.25"

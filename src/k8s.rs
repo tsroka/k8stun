@@ -9,16 +9,17 @@
 
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Endpoints, Namespace, Pod, Service};
 use kube::{
     api::{Api, ListParams},
     Client, Config,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::vip::ServiceId;
@@ -45,9 +46,9 @@ pub struct PodEndpoint {
 pub struct K8sClient {
     client: Client,
     /// Cache of service to pod endpoints.
-    endpoint_cache: Arc<RwLock<HashMap<ServiceKey, Vec<PodEndpoint>>>>,
+    endpoint_cache: DashMap<ServiceKey, Vec<PodEndpoint>>,
     /// Round-robin index for load balancing.
-    rr_index: Arc<RwLock<HashMap<ServiceKey, usize>>>,
+    rr_index: DashMap<ServiceKey, AtomicUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -87,8 +88,8 @@ impl K8sClient {
 
         Ok(Self {
             client,
-            endpoint_cache: Arc::new(RwLock::new(HashMap::new())),
-            rr_index: Arc::new(RwLock::new(HashMap::new())),
+            endpoint_cache: DashMap::new(),
+            rr_index: DashMap::new(),
         })
     }
 
@@ -106,8 +107,8 @@ impl K8sClient {
 
         Ok(Self {
             client,
-            endpoint_cache: Arc::new(RwLock::new(HashMap::new())),
-            rr_index: Arc::new(RwLock::new(HashMap::new())),
+            endpoint_cache: DashMap::new(),
+            rr_index: DashMap::new(),
         })
     }
 
@@ -150,13 +151,10 @@ impl K8sClient {
             namespace: service.namespace.clone(),
         };
 
-        // Check cache first
-        {
-            let cache = self.endpoint_cache.read().await;
-            if let Some(endpoints) = cache.get(&key) {
-                if !endpoints.is_empty() {
-                    return Ok(endpoints.clone());
-                }
+        // Check cache first (lock-free read)
+        if let Some(endpoints) = self.endpoint_cache.get(&key) {
+            if !endpoints.is_empty() {
+                return Ok(endpoints.clone());
             }
         }
 
@@ -220,11 +218,8 @@ impl K8sClient {
             ));
         }
 
-        // Update cache
-        {
-            let mut cache = self.endpoint_cache.write().await;
-            cache.insert(key, endpoints.clone());
-        }
+        // Update cache (DashMap handles concurrent access)
+        self.endpoint_cache.insert(key, endpoints.clone());
 
         info!(
             "Found {} endpoints for {}/{}",
@@ -249,10 +244,13 @@ impl K8sClient {
             namespace: service.namespace.clone(),
         };
 
-        let mut rr = self.rr_index.write().await;
-        let index = rr.entry(key).or_insert(0);
-        let endpoint = endpoints[*index % endpoints.len()].clone();
-        *index = (*index + 1) % endpoints.len();
+        // Get or create the round-robin index atomically
+        let index = self
+            .rr_index
+            .entry(key)
+            .or_insert_with(|| AtomicUsize::new(0));
+        let current = index.fetch_add(1, Ordering::Relaxed);
+        let endpoint = endpoints[current % endpoints.len()].clone();
 
         Ok(endpoint)
     }
@@ -310,8 +308,7 @@ impl K8sClient {
             namespace: service.namespace.clone(),
         };
 
-        let mut cache = self.endpoint_cache.write().await;
-        cache.remove(&key);
+        self.endpoint_cache.remove(&key);
 
         debug!(
             "Invalidated cache for {}/{}",
@@ -321,9 +318,163 @@ impl K8sClient {
 
     /// Clears all cached endpoints.
     pub async fn clear_cache(&self) {
-        let mut cache = self.endpoint_cache.write().await;
-        cache.clear();
+        self.endpoint_cache.clear();
         info!("Cleared all endpoint cache");
+    }
+
+    /// Finds a pod by its IP address.
+    ///
+    /// This is used for IP-based pod DNS resolution (e.g., 172-17-0-3.namespace.pod.cluster.local).
+    pub async fn get_pod_by_ip(&self, ip: &str, namespace: &str, port: u16) -> Result<PodEndpoint> {
+        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        // List pods and find the one with matching IP
+        let pods = pod_api
+            .list(&ListParams::default())
+            .await
+            .context(format!("Failed to list pods in namespace {}", namespace))?;
+
+        for pod in pods {
+            let pod_ip = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.pod_ip.as_ref())
+                .map(|s| s.as_str());
+
+            if pod_ip == Some(ip) {
+                let name = pod.metadata.name.unwrap_or_default();
+                debug!(
+                    "Found pod {} with IP {} in namespace {}",
+                    name, ip, namespace
+                );
+                return Ok(PodEndpoint {
+                    name,
+                    namespace: namespace.to_string(),
+                    ip: ip.to_string(),
+                    port,
+                });
+            }
+        }
+
+        Err(anyhow!(
+            "No pod found with IP {} in namespace {}",
+            ip,
+            namespace
+        ))
+    }
+
+    /// Finds a pod by name.
+    ///
+    /// This is used for StatefulSet pod DNS resolution (e.g., mysql-0.mysql.namespace.svc.cluster.local).
+    pub async fn get_pod_by_name(
+        &self,
+        name: &str,
+        namespace: &str,
+        port: u16,
+    ) -> Result<PodEndpoint> {
+        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        let pod = pod_api
+            .get(name)
+            .await
+            .context(format!("Failed to get pod {}/{}", namespace, name))?;
+
+        let ip = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.pod_ip.clone())
+            .ok_or_else(|| anyhow!("Pod {}/{} has no IP address", namespace, name))?;
+
+        // Check if pod is running
+        let phase = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_ref())
+            .map(|s| s.as_str());
+
+        if phase != Some("Running") {
+            return Err(anyhow!(
+                "Pod {}/{} is not running (phase: {:?})",
+                namespace,
+                name,
+                phase
+            ));
+        }
+
+        debug!("Found pod {}/{} with IP {}", namespace, name, ip);
+
+        Ok(PodEndpoint {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            ip,
+            port,
+        })
+    }
+
+    /// Finds a pod by hostname and subdomain.
+    ///
+    /// This is used for pods with custom hostname/subdomain (e.g., hostname.subdomain.namespace.svc.cluster.local).
+    /// The subdomain typically corresponds to a headless service name.
+    pub async fn get_pod_by_hostname(
+        &self,
+        hostname: &str,
+        subdomain: &str,
+        namespace: &str,
+        port: u16,
+    ) -> Result<PodEndpoint> {
+        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        // List pods and find the one with matching hostname and subdomain
+        let pods = pod_api
+            .list(&ListParams::default())
+            .await
+            .context(format!("Failed to list pods in namespace {}", namespace))?;
+
+        for pod in pods {
+            let pod_hostname = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.hostname.as_ref())
+                .map(|s| s.as_str());
+
+            let pod_subdomain = pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.subdomain.as_ref())
+                .map(|s| s.as_str());
+
+            if pod_hostname == Some(hostname) && pod_subdomain == Some(subdomain) {
+                let name = pod.metadata.name.unwrap_or_default();
+                let ip = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.pod_ip.clone())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Pod with hostname {}.{} in {} has no IP",
+                            hostname,
+                            subdomain,
+                            namespace
+                        )
+                    })?;
+
+                debug!(
+                    "Found pod {} with hostname {}.{} in namespace {}",
+                    name, hostname, subdomain, namespace
+                );
+
+                return Ok(PodEndpoint {
+                    name,
+                    namespace: namespace.to_string(),
+                    ip,
+                    port,
+                });
+            }
+        }
+
+        // If not found by hostname/subdomain, try by name (StatefulSet pods often have
+        // hostname matching their name)
+        self.get_pod_by_name(hostname, namespace, port).await
     }
 
     /// Watches for service changes in the given namespaces.
