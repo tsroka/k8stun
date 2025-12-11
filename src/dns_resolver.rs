@@ -93,13 +93,10 @@ fn bind_socket_to_interface(socket: &Socket, interface_name: &str) -> io::Result
     socket
         .bind_device(Some(interface_name.as_bytes()))
         .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Failed to bind to interface '{}': {} (may require root/CAP_NET_RAW)",
-                    interface_name, e
-                ),
-            )
+            io::Error::other(format!(
+                "Failed to bind to interface '{}': {} (may require root/CAP_NET_RAW)",
+                interface_name, e
+            ))
         })
 }
 

@@ -510,7 +510,7 @@
 
     <div class="toolbar">
       <label class="filter-toggle">
-        <input type="checkbox" id="hideInactive">
+        <input type="checkbox" id="hideInactive" checked>
         <span class="toggle-track"></span>
         <span class="toggle-label">Hide inactive VIPs</span>
       </label>
@@ -543,11 +543,7 @@
   </div>
 
   <script>
-    // State management
-    const vipData = new Map();
-    let eventSource = null;
-    let reconnectTimeout = null;
-    let hideInactive = false;
+
 
     // DOM elements
     const statusDot = document.getElementById('statusDot');
@@ -560,6 +556,12 @@
     const totalBytesReceivedEl = document.getElementById('totalBytesReceived');
     const hideInactiveToggle = document.getElementById('hideInactive');
     const visibleCountEl = document.getElementById('visibleCount');
+
+    // State management
+    const vipData = new Map();
+    let eventSource = null;
+    let reconnectTimeout = null;
+    let hideInactive = hideInactiveToggle.checked;
 
     // Utility functions
     function formatBytes(bytes) {
