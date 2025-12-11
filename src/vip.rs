@@ -12,33 +12,36 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info};
 
 /// Represents a Kubernetes service identifier.
+///
+/// Note: Port is intentionally not included here. A service gets the same VIP
+/// regardless of which port you connect to. The port is determined at connection
+/// time from the TCP destination port.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ServiceId {
     /// The service name.
     pub name: String,
     /// The namespace the service is in.
     pub namespace: String,
-    /// The target port on the service.
-    pub port: u16,
 }
 
 /// Represents a Kubernetes pod identifier.
+///
+/// Note: Port is intentionally not included here. A pod gets the same VIP
+/// regardless of which port you connect to. The port is determined at connection
+/// time from the TCP destination port.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PodId {
     /// The pod name.
     pub name: String,
     /// The namespace the pod is in.
     pub namespace: String,
-    /// The target port on the pod.
-    pub port: u16,
 }
 
 impl PodId {
-    pub fn new(name: impl Into<String>, namespace: impl Into<String>, port: u16) -> Self {
+    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             namespace: namespace.into(),
-            port,
         }
     }
 
@@ -72,14 +75,6 @@ impl TargetId {
         }
     }
 
-    /// Returns the port of the target.
-    pub fn port(&self) -> u16 {
-        match self {
-            TargetId::Service(s) => s.port,
-            TargetId::Pod(p) => p.port,
-        }
-    }
-
     /// Returns true if this is a service target.
     pub fn is_service(&self) -> bool {
         matches!(self, TargetId::Service(_))
@@ -92,33 +87,32 @@ impl TargetId {
 }
 
 impl ServiceId {
-    pub fn new(name: impl Into<String>, namespace: impl Into<String>, port: u16) -> Self {
+    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             namespace: namespace.into(),
-            port,
         }
     }
 
     /// Parses a service identifier from a DNS-like name.
     /// Supports formats like:
-    /// - `service.namespace` (assumes port 80)
-    /// - `service.namespace.svc.cluster.local` (assumes port 80)
-    pub fn from_dns_name(name: &str, port: u16) -> Option<Self> {
+    /// - `service.namespace`
+    /// - `service.namespace.svc.cluster.local`
+    pub fn from_dns_name(name: &str) -> Option<Self> {
         let name = name.trim_end_matches('.');
 
         // Try to parse as service.namespace.svc.cluster.local
         if let Some(stripped) = name.strip_suffix(".svc.cluster.local") {
             let parts: Vec<&str> = stripped.splitn(2, '.').collect();
             if parts.len() == 2 {
-                return Some(Self::new(parts[0], parts[1], port));
+                return Some(Self::new(parts[0], parts[1]));
             }
         }
 
         // Try to parse as service.namespace
         let parts: Vec<&str> = name.splitn(2, '.').collect();
         if parts.len() == 2 {
-            return Some(Self::new(parts[0], parts[1], port));
+            return Some(Self::new(parts[0], parts[1]));
         }
 
         None
@@ -297,37 +291,34 @@ mod tests {
 
     #[test]
     fn test_service_id_from_dns_name() {
-        let svc = ServiceId::from_dns_name("backend.default", 80).unwrap();
+        let svc = ServiceId::from_dns_name("backend.default").unwrap();
         assert_eq!(svc.name, "backend");
         assert_eq!(svc.namespace, "default");
-        assert_eq!(svc.port, 80);
 
-        let svc = ServiceId::from_dns_name("api.production.svc.cluster.local", 8080).unwrap();
+        let svc = ServiceId::from_dns_name("api.production.svc.cluster.local").unwrap();
         assert_eq!(svc.name, "api");
         assert_eq!(svc.namespace, "production");
-        assert_eq!(svc.port, 8080);
     }
 
     #[test]
     fn test_service_id_dns_names() {
-        let svc = ServiceId::new("backend", "default", 80);
+        let svc = ServiceId::new("backend", "default");
         assert_eq!(svc.dns_name(), "backend.default.svc.cluster.local");
         assert_eq!(svc.short_dns_name(), "backend.default");
     }
 
     #[test]
     fn test_pod_id() {
-        let pod = PodId::new("mysql-0", "default", 3306);
+        let pod = PodId::new("mysql-0", "default");
         assert_eq!(pod.name, "mysql-0");
         assert_eq!(pod.namespace, "default");
-        assert_eq!(pod.port, 3306);
         assert_eq!(pod.dns_name(), "mysql-0.default.pod.cluster.local");
     }
 
     #[test]
     fn test_target_id() {
-        let svc = ServiceId::new("backend", "default", 80);
-        let pod = PodId::new("mysql-0", "default", 3306);
+        let svc = ServiceId::new("backend", "default");
+        let pod = PodId::new("mysql-0", "default");
 
         let target_svc = TargetId::Service(svc.clone());
         let target_pod = TargetId::Pod(pod.clone());
@@ -336,21 +327,19 @@ mod tests {
         assert!(!target_svc.is_pod());
         assert_eq!(target_svc.name(), "backend");
         assert_eq!(target_svc.namespace(), "default");
-        assert_eq!(target_svc.port(), 80);
 
         assert!(target_pod.is_pod());
         assert!(!target_pod.is_service());
         assert_eq!(target_pod.name(), "mysql-0");
         assert_eq!(target_pod.namespace(), "default");
-        assert_eq!(target_pod.port(), 3306);
     }
 
     #[tokio::test]
     async fn test_vip_allocation() {
         let manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
 
-        let svc1 = ServiceId::new("svc1", "default", 80);
-        let svc2 = ServiceId::new("svc2", "default", 80);
+        let svc1 = ServiceId::new("svc1", "default");
+        let svc2 = ServiceId::new("svc2", "default");
 
         let vip1 = manager.get_or_allocate_vip(svc1.clone()).await.unwrap();
         let vip2 = manager.get_or_allocate_vip(svc2.clone()).await.unwrap();
@@ -371,8 +360,8 @@ mod tests {
     async fn test_pod_vip_allocation() {
         let manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
 
-        let pod1 = PodId::new("mysql-0", "default", 3306);
-        let pod2 = PodId::new("mysql-1", "default", 3306);
+        let pod1 = PodId::new("mysql-0", "default");
+        let pod2 = PodId::new("mysql-1", "default");
 
         let vip1 = manager
             .get_or_allocate_vip_for_pod(pod1.clone())
@@ -403,8 +392,8 @@ mod tests {
     async fn test_mixed_allocation() {
         let manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
 
-        let svc = ServiceId::new("mysql", "default", 3306);
-        let pod = PodId::new("mysql-0", "default", 3306);
+        let svc = ServiceId::new("mysql", "default");
+        let pod = PodId::new("mysql-0", "default");
 
         let svc_vip = manager.get_or_allocate_vip(svc.clone()).await.unwrap();
         let pod_vip = manager

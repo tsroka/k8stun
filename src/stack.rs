@@ -74,6 +74,8 @@ impl AsyncWrite for TcpStream {
 pub struct AcceptedConnection {
     pub stream: TcpStream,
     pub target: TargetId,
+    /// The destination port from the intercepted connection.
+    pub port: u16,
 }
 
 /// The userspace network stack that handles TCP connections.
@@ -226,16 +228,7 @@ async fn run_tcp_listener(
 
         // Look up the target (service or pod)
         let target = match vip_manager.lookup_target(dst_ip).await {
-            Some(TargetId::Service(mut svc)) => {
-                // Update the port to the connection port
-                svc.port = dst_port;
-                TargetId::Service(svc)
-            }
-            Some(TargetId::Pod(mut pod)) => {
-                // Update the port to the connection port
-                pod.port = dst_port;
-                TargetId::Pod(pod)
-            }
+            Some(target) => target,
             None => {
                 warn!("No target found for VIP {}, refusing connection", dst_ip);
                 // lwip's TcpStream sends RST on drop if not closed, so just drop it
@@ -250,7 +243,11 @@ async fn run_tcp_listener(
             peer_addr,
         };
 
-        let connection = AcceptedConnection { stream, target };
+        let connection = AcceptedConnection {
+            stream,
+            target,
+            port: dst_port,
+        };
 
         if let Err(e) = connection_tx.send(connection).await {
             error!("Failed to send connection to handler: {}", e);
@@ -315,21 +312,20 @@ mod tests {
 
     #[test]
     fn test_service_id_creation() {
-        let service = ServiceId::new("backend", "default", 8080);
+        let service = ServiceId::new("backend", "default");
         assert_eq!(service.name, "backend");
         assert_eq!(service.namespace, "default");
-        assert_eq!(service.port, 8080);
     }
 
     #[test]
     fn test_target_id() {
         use crate::vip::PodId;
 
-        let svc_target = TargetId::Service(ServiceId::new("backend", "default", 80));
+        let svc_target = TargetId::Service(ServiceId::new("backend", "default"));
         assert!(svc_target.is_service());
         assert!(!svc_target.is_pod());
 
-        let pod_target = TargetId::Pod(PodId::new("mysql-0", "default", 3306));
+        let pod_target = TargetId::Pod(PodId::new("mysql-0", "default"));
         assert!(pod_target.is_pod());
         assert!(!pod_target.is_service());
     }

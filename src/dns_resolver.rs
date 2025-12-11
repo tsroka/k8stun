@@ -317,7 +317,7 @@ impl DnsResolver {
         namespace: &str,
     ) -> Result<Message> {
         // Validate that the service exists in Kubernetes before allocating a VIP
-        let service = ServiceId::new(service_name, namespace, 80);
+        let service = ServiceId::new(service_name, namespace);
         if let Err(e) = self.k8s_client.get_service_endpoints(&service).await {
             debug!(
                 "Service {}.{} not found in K8s: {}",
@@ -349,13 +349,13 @@ impl DnsResolver {
             PodDnsInfo::Ip { ip, namespace } => {
                 // Validate pod exists by IP before allocating VIP
                 let ip_str = ip.to_string();
-                if let Err(e) = self.k8s_client.get_pod_by_ip(&ip_str, namespace, 80).await {
+                if let Err(e) = self.k8s_client.get_pod_by_ip(&ip_str, namespace).await {
                     debug!("Pod with IP {} not found in {}: {}", ip, namespace, e);
                     return Ok(query.build_error_response(ResponseCode::NXDomain));
                 }
                 let pod_name = ip_str.replace('.', "-");
                 (
-                    PodId::new(&pod_name, namespace, 80),
+                    PodId::new(&pod_name, namespace),
                     format!("{}.{}.pod", ip, namespace),
                 )
             }
@@ -365,16 +365,12 @@ impl DnsResolver {
                 namespace,
             } => {
                 // Validate StatefulSet pod exists before allocating VIP
-                if let Err(e) = self
-                    .k8s_client
-                    .get_pod_by_name(pod_name, namespace, 80)
-                    .await
-                {
+                if let Err(e) = self.k8s_client.get_pod_by_name(pod_name, namespace).await {
                     debug!("Pod {} not found in {}: {}", pod_name, namespace, e);
                     return Ok(query.build_error_response(ResponseCode::NXDomain));
                 }
                 (
-                    PodId::new(pod_name, namespace, 80),
+                    PodId::new(pod_name, namespace),
                     format!("{}.{}", pod_name, namespace),
                 )
             }
@@ -386,7 +382,7 @@ impl DnsResolver {
                 // Validate pod with hostname/subdomain exists before allocating VIP
                 if let Err(e) = self
                     .k8s_client
-                    .get_pod_by_hostname(hostname, subdomain, namespace, 80)
+                    .get_pod_by_hostname(hostname, subdomain, namespace)
                     .await
                 {
                     debug!(
@@ -397,7 +393,7 @@ impl DnsResolver {
                 }
                 let pod_name = format!("{}.{}", hostname, subdomain);
                 (
-                    PodId::new(&pod_name, namespace, 80),
+                    PodId::new(&pod_name, namespace),
                     format!("{}.{}.{}", hostname, subdomain, namespace),
                 )
             }

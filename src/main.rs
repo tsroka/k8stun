@@ -142,21 +142,19 @@ async fn main() -> Result<()> {
         match k8s_client.list_services(&namespaces).await {
             Ok(services) => {
                 for svc in services {
-                    for port in svc.ports {
-                        let service_id = ServiceId::new(&svc.name, &svc.namespace, port);
-                        match vip_manager.get_or_allocate_vip(service_id.clone()).await {
-                            Ok(vip) => {
-                                info!(
-                                    "  {} -> {}.{}:{} (port {})",
-                                    vip, svc.name, svc.namespace, port, port
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to allocate VIP for {}.{}: {}",
-                                    svc.name, svc.namespace, e
-                                );
-                            }
+                    let service_id = ServiceId::new(&svc.name, &svc.namespace);
+                    match vip_manager.get_or_allocate_vip(service_id.clone()).await {
+                        Ok(vip) => {
+                            info!(
+                                "  {} -> {}.{} (ports: {:?})",
+                                vip, svc.name, svc.namespace, svc.ports
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to allocate VIP for {}.{}: {}",
+                                svc.name, svc.namespace, e
+                            );
                         }
                     }
                 }
@@ -172,16 +170,20 @@ async fn main() -> Result<()> {
 
     // Pre-allocate VIPs for explicitly specified services
     for service_spec in &args.services {
-        if let Some((service_part, port_str)) = service_spec.rsplit_once(':') {
-            let port: u16 = port_str.parse().unwrap_or(80);
-            if let Some(service_id) = ServiceId::from_dns_name(service_part, port) {
-                match vip_manager.get_or_allocate_vip(service_id.clone()).await {
-                    Ok(vip) => {
-                        info!("Pre-allocated {} -> {:?}", vip, service_id);
-                    }
-                    Err(e) => {
-                        warn!("Failed to pre-allocate VIP: {}", e);
-                    }
+        // Support both "service.namespace" and "service.namespace:port" formats
+        // Port is ignored for VIP allocation (same VIP for all ports)
+        let service_part = service_spec
+            .rsplit_once(':')
+            .map(|(s, _)| s)
+            .unwrap_or(service_spec);
+
+        if let Some(service_id) = ServiceId::from_dns_name(service_part) {
+            match vip_manager.get_or_allocate_vip(service_id.clone()).await {
+                Ok(vip) => {
+                    info!("Pre-allocated {} -> {:?}", vip, service_id);
+                }
+                Err(e) => {
+                    warn!("Failed to pre-allocate VIP: {}", e);
                 }
             }
         }
@@ -286,8 +288,7 @@ async fn main() -> Result<()> {
     // Show allocated VIPs
     let mappings = vip_manager.get_all_mappings().await;
     for (vip, service) in &mappings {
-        info!("  curl http://{}:{}/", vip, service.port);
-        info!("    -> {}.{}", service.name, service.namespace);
+        info!("  {} -> {}.{}", vip, service.name, service.namespace);
     }
 
     if mappings.is_empty() {
@@ -324,15 +325,17 @@ async fn main() -> Result<()> {
             Some(connection) = network_stack.accept() => {
                 let target = connection.target;
                 let stream = connection.stream;
+                let port = connection.port;
                 let k8s = Arc::clone(&k8s_client);
 
                 info!(
                     "New connection to {}.{}:{} from {}",
-                    target.name(), target.namespace(), target.port(), stream.peer_addr
+                    target.name(), target.namespace(), port, stream.peer_addr
                 );
 
                 // Spawn a task to handle the connection
                 tokio::spawn(async move {
+
                     // Get a pod endpoint based on target type
                     let (endpoint, label) = match &target {
                         TargetId::Service(service) => {
@@ -341,8 +344,8 @@ async fn main() -> Result<()> {
                                 Ok(ep) => {
                                     let label = format!(
                                         "{}.{}:{} -> {}/{}:{}",
-                                        service.name, service.namespace, service.port,
-                                        ep.namespace, ep.name, ep.port
+                                        service.name, service.namespace, port,
+                                        ep.namespace, ep.name, port
                                     );
                                     (ep, label)
                                 }
@@ -361,8 +364,8 @@ async fn main() -> Result<()> {
                                 Ok(ep) => {
                                     let label = format!(
                                         "pod:{}.{}:{} -> {}/{}:{}",
-                                        pod.name, pod.namespace, pod.port,
-                                        ep.namespace, ep.name, ep.port
+                                        pod.name, pod.namespace, port,
+                                        ep.namespace, ep.name, port
                                     );
                                     (ep, label)
                                 }
@@ -379,11 +382,11 @@ async fn main() -> Result<()> {
 
                     info!(
                         "Forwarding to pod {}/{} port {}",
-                        endpoint.namespace, endpoint.name, endpoint.port
+                        endpoint.namespace, endpoint.name, port
                     );
 
                     // Establish port-forward to the pod
-                    let k8s_stream = match k8s.port_forward(&endpoint).await {
+                    let k8s_stream = match k8s.port_forward(&endpoint, port).await {
                         Ok(s) => s,
                         Err(e) => {
                             error!("Failed to establish port-forward: {}", e);
@@ -453,14 +456,14 @@ async fn get_pod_endpoint(k8s: &K8sClient, pod: &PodId) -> anyhow::Result<PodEnd
     if is_dashed_ip(&pod.name) {
         // Convert dashed IP back to dotted format
         let ip = pod.name.replace('-', ".");
-        return k8s.get_pod_by_ip(&ip, &pod.namespace, pod.port).await;
+        return k8s.get_pod_by_ip(&ip, &pod.namespace).await;
     }
 
     // Check if the pod name contains a dot (hostname.subdomain format)
     if let Some((hostname, subdomain)) = pod.name.split_once('.') {
         // Try to find by hostname and subdomain first
         match k8s
-            .get_pod_by_hostname(hostname, subdomain, &pod.namespace, pod.port)
+            .get_pod_by_hostname(hostname, subdomain, &pod.namespace)
             .await
         {
             Ok(ep) => return Ok(ep),
@@ -471,8 +474,7 @@ async fn get_pod_endpoint(k8s: &K8sClient, pod: &PodId) -> anyhow::Result<PodEnd
     }
 
     // Otherwise, look up by pod name directly
-    k8s.get_pod_by_name(&pod.name, &pod.namespace, pod.port)
-        .await
+    k8s.get_pod_by_name(&pod.name, &pod.namespace).await
 }
 
 /// Checks if a string looks like a dashed IP address (e.g., "172-17-0-3").

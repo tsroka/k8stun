@@ -33,13 +33,15 @@ pub fn new_namespace_set() -> NamespaceSet {
     Arc::new(ArcSwap::from_pointee(HashSet::new()))
 }
 
-/// Represents a pod endpoint that can be connected to.
+/// Represents a pod that can be connected to.
+///
+/// Note: Port is not included here because it comes from the intercepted
+/// connection's destination port, not from Kubernetes.
 #[derive(Debug, Clone)]
 pub struct PodEndpoint {
     pub name: String,
     pub namespace: String,
     pub ip: String,
-    pub port: u16,
 }
 
 /// Kubernetes client wrapper with service discovery capabilities.
@@ -179,18 +181,6 @@ impl K8sClient {
             .iter()
             .flat_map(|subset| {
                 let addresses = subset.addresses.as_deref().unwrap_or(&[]);
-                let port = subset
-                    .ports
-                    .as_ref()
-                    .and_then(|ports| {
-                        // Try to find a matching port, or use the first one
-                        ports
-                            .iter()
-                            .find(|p| p.port as u16 == service.port)
-                            .or_else(|| ports.first())
-                            .map(|p| p.port as u16)
-                    })
-                    .unwrap_or(service.port);
 
                 addresses.iter().map(move |addr| {
                     let ip = addr.ip.clone();
@@ -204,7 +194,6 @@ impl K8sClient {
                         name,
                         namespace: service.namespace.clone(),
                         ip,
-                        port,
                     }
                 })
             })
@@ -257,29 +246,31 @@ impl K8sClient {
 
     /// Establishes a port-forward connection to a pod.
     ///
+    /// The port parameter is the destination port from the intercepted connection.
     /// Returns streams for reading and writing to the forwarded connection.
     pub async fn port_forward(
         &self,
         endpoint: &PodEndpoint,
+        port: u16,
     ) -> Result<impl AsyncRead + AsyncWrite + Unpin> {
         info!(
             "Port-forwarding to {}/{} port {}",
-            endpoint.namespace, endpoint.name, endpoint.port
+            endpoint.namespace, endpoint.name, port
         );
 
         let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), &endpoint.namespace);
 
         let mut pf = pod_api
-            .portforward(&endpoint.name, &[endpoint.port])
+            .portforward(&endpoint.name, &[port])
             .await
             .context(format!(
                 "Failed to establish port-forward to {}/{}:{}",
-                endpoint.namespace, endpoint.name, endpoint.port
+                endpoint.namespace, endpoint.name, port
             ))?;
 
         // Get the stream for our port
         let stream = pf
-            .take_stream(endpoint.port)
+            .take_stream(port)
             .ok_or_else(|| anyhow!("Failed to get port-forward stream"))?;
 
         // Spawn a task to handle the port-forward lifecycle
@@ -296,8 +287,9 @@ impl K8sClient {
     pub async fn port_forward_split(
         &self,
         endpoint: &PodEndpoint,
+        port: u16,
     ) -> Result<(impl AsyncRead + Unpin, impl AsyncWrite + Unpin)> {
-        let stream = self.port_forward(endpoint).await?;
+        let stream = self.port_forward(endpoint, port).await?;
         Ok(tokio::io::split(stream))
     }
 
@@ -325,7 +317,7 @@ impl K8sClient {
     /// Finds a pod by its IP address.
     ///
     /// This is used for IP-based pod DNS resolution (e.g., 172-17-0-3.namespace.pod.cluster.local).
-    pub async fn get_pod_by_ip(&self, ip: &str, namespace: &str, port: u16) -> Result<PodEndpoint> {
+    pub async fn get_pod_by_ip(&self, ip: &str, namespace: &str) -> Result<PodEndpoint> {
         let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
         // List pods and find the one with matching IP
@@ -351,7 +343,6 @@ impl K8sClient {
                     name,
                     namespace: namespace.to_string(),
                     ip: ip.to_string(),
-                    port,
                 });
             }
         }
@@ -366,12 +357,7 @@ impl K8sClient {
     /// Finds a pod by name.
     ///
     /// This is used for StatefulSet pod DNS resolution (e.g., mysql-0.mysql.namespace.svc.cluster.local).
-    pub async fn get_pod_by_name(
-        &self,
-        name: &str,
-        namespace: &str,
-        port: u16,
-    ) -> Result<PodEndpoint> {
+    pub async fn get_pod_by_name(&self, name: &str, namespace: &str) -> Result<PodEndpoint> {
         let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
         let pod = pod_api
@@ -407,7 +393,6 @@ impl K8sClient {
             name: name.to_string(),
             namespace: namespace.to_string(),
             ip,
-            port,
         })
     }
 
@@ -420,7 +405,6 @@ impl K8sClient {
         hostname: &str,
         subdomain: &str,
         namespace: &str,
-        port: u16,
     ) -> Result<PodEndpoint> {
         let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
@@ -467,14 +451,13 @@ impl K8sClient {
                     name,
                     namespace: namespace.to_string(),
                     ip,
-                    port,
                 });
             }
         }
 
         // If not found by hostname/subdomain, try by name (StatefulSet pods often have
         // hostname matching their name)
-        self.get_pod_by_name(hostname, namespace, port).await
+        self.get_pod_by_name(hostname, namespace).await
     }
 
     /// Watches for service changes in the given namespaces.
