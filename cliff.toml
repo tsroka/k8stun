@@ -31,16 +31,16 @@ body = """
 | sort(attribute="scope") %}
 - **{{ commit.scope }}**: {{ commit.message | upper_first }}
   {%- if commit.breaking %} [**BREAKING**]{% endif -%}
-  {%- if commit.github.username %} by @{{ commit.github.username }}{%- endif -%}
-  {%- if commit.github.pr_number %} in [#{{ commit.github.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.github.pr_number }}){%- endif %}
+  {%- if commit.remote.username %} by @{{ commit.remote.username }}{%- endif -%}
+  {%- if commit.remote.pr_number %} in [#{{ commit.remote.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.remote.pr_number }}){%- endif %}
 {%- endfor %}
 {% for commit in commits %}
 {%- if commit.scope -%}
 {% else -%}
 - {{ commit.message | upper_first }}
   {%- if commit.breaking %} [**BREAKING**]{% endif -%}
-  {%- if commit.github.username %} by @{{ commit.github.username }}{%- endif -%}
-  {%- if commit.github.pr_number %} in [#{{ commit.github.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.github.pr_number }}){%- endif %}
+  {%- if commit.remote.username %} by @{{ commit.remote.username }}{%- endif -%}
+  {%- if commit.remote.pr_number %} in [#{{ commit.remote.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.remote.pr_number }}){%- endif %}
 {% endif -%}
 {%- endfor -%}
 {% endfor %}
@@ -53,9 +53,6 @@ footer = """
 
 # Remove the leading and trailing whitespace from templates
 trim = true
-
-# Postprocessors for the changelog
-[changelog.postprocessors]
 
 [git]
 # Parse conventional commits
