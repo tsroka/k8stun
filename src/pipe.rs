@@ -3,47 +3,10 @@
 //! This module handles the data plane - copying bytes between
 //! the userspace TCP stack and Kubernetes port-forward streams.
 
-
-use anyhow::Result;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::vip::ActiveConnection;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, trace};
-
-/// Statistics for a pipe connection.
-#[derive(Debug, Default)]
-pub struct PipeStats {
-    /// Bytes transferred from client to server.
-    pub bytes_to_server: AtomicU64,
-    /// Bytes transferred from server to client.
-    pub bytes_to_client: AtomicU64,
-}
-
-impl PipeStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn total_bytes(&self) -> u64 {
-        self.bytes_to_server.load(Ordering::Relaxed) + self.bytes_to_client.load(Ordering::Relaxed)
-    }
-}
-
-/// Result of a pipe operation.
-#[derive(Debug)]
-pub enum PipeResult {
-    /// Both sides closed gracefully.
-    Completed { stats: Arc<PipeStats> },
-    /// Client closed first.
-    ClientClosed { stats: Arc<PipeStats> },
-    /// Server closed first.
-    ServerClosed { stats: Arc<PipeStats> },
-    /// An error occurred.
-    Error {
-        error: String,
-        stats: Arc<PipeStats>,
-    },
-}
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::io::{InspectReader, InspectWriter};
 
 /// Pipes data bidirectionally between two streams.
 ///
@@ -52,138 +15,85 @@ pub enum PipeResult {
 /// - From `server` to `client`
 ///
 /// The pipe continues until either side closes or an error occurs.
-pub async fn pipe<C, S>(client: C, server: S) -> PipeResult
+pub async fn pipe<C, S>(
+    conn: ActiveConnection,
+    client: C,
+    mut server: S,
+) -> std::io::Result<(u64, u64)>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let stats = Arc::new(PipeStats::new());
+    let conn_read = Arc::new(conn);
+    let conn_write = conn_read.clone();
 
-    let (client_read, client_write) = tokio::io::split(client);
-    let (server_read, server_write) = tokio::io::split(server);
-
-    let stats_c2s = Arc::clone(&stats);
-    let stats_s2c = Arc::clone(&stats);
-
-    // Client to server
-    let c2s = tokio::spawn(async move {
-        copy_with_stats(client_read, server_write, &stats_c2s.bytes_to_server).await
+    let client = InspectReader::new(client, move |data| {
+        conn_read.add_bytes_sent(data.len() as u64);
     });
 
-    // Server to client
-    let s2c = tokio::spawn(async move {
-        copy_with_stats(server_read, client_write, &stats_s2c.bytes_to_client).await
+    let mut client = InspectWriter::new(client, move |data| {
+        conn_write.add_bytes_received(data.len() as u64);
     });
 
-    // Wait for both directions to complete
-    let (c2s_result, s2c_result) = tokio::join!(c2s, s2c);
-
-    let c2s_ok = c2s_result.as_ref().map(|r| r.is_ok()).unwrap_or(false);
-    let s2c_ok = s2c_result.as_ref().map(|r| r.is_ok()).unwrap_or(false);
-
-    match (c2s_ok, s2c_ok) {
-        (true, true) => PipeResult::Completed { stats },
-        (false, true) => PipeResult::ClientClosed { stats },
-        (true, false) => PipeResult::ServerClosed { stats },
-        (false, false) => {
-            let error = c2s_result
-                .err()
-                .map(|e| e.to_string())
-                .or_else(|| s2c_result.err().map(|e| e.to_string()))
-                .unwrap_or_else(|| "Unknown error".to_string());
-            PipeResult::Error { error, stats }
-        }
-    }
-}
-
-/// Copies data from reader to writer, tracking statistics.
-async fn copy_with_stats<R, W>(
-    mut reader: R,
-    mut writer: W,
-    bytes_counter: &AtomicU64,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = [0u8; 8192];
-    let mut total = 0u64;
-
-    loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) => break, // EOF
-            Ok(n) => n,
-            Err(e) => {
-                trace!("Read error: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        if let Err(e) = writer.write_all(&buf[..n]).await {
-            trace!("Write error: {}", e);
-            return Err(e.into());
-        }
-
-        total += n as u64;
-        bytes_counter.fetch_add(n as u64, Ordering::Relaxed);
-
-        trace!("Copied {} bytes (total: {})", n, total);
-    }
-
-    // Ensure all data is flushed
-    if let Err(e) = writer.flush().await {
-        trace!("Flush error: {}", e);
-    }
-
-    // Try to shutdown the write side
-    if let Err(e) = writer.shutdown().await {
-        trace!("Shutdown error: {}", e);
-    }
-
-    debug!("Stream copy completed, total {} bytes", total);
-    Ok(total)
+    tokio::io::copy_bidirectional(&mut client, &mut server).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::duplex;
+    use crate::vip::ConnectionId;
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_pipe_basic() {
-        let (client, server_end) = duplex(1024);
-        let (server, client_end) = duplex(1024);
+        let (client, mut server_end) = duplex(1024);
+        let (server, mut client_end) = duplex(1024);
 
-        // Spawn a task to echo data on the server side
-        tokio::spawn(async move {
-            let (mut read, mut write) = tokio::io::split(server_end);
+        // Spawn a task to simulate the "client" side sending data
+        let client_task = tokio::spawn(async move {
+            client_end.write_all(b"hello").await.unwrap();
+            client_end.shutdown().await.unwrap();
+            // Keep the connection alive to read the response
+            let mut response = Vec::new();
+            client_end.read_to_end(&mut response).await.unwrap();
+            response
+        });
+
+        // Spawn a task to echo data on the "server" side (minus 1 byte)
+        let server_task = tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            while let Ok(n) = read.read(&mut buf).await {
-                if n == 0 {
-                    break;
+            if let Ok(n) = server_end.read(&mut buf).await {
+                if n > 0 {
+                    // Echo back n-1 bytes
+                    server_end.write_all(&buf[..(n - 1)]).await.unwrap();
                 }
-                let _ = write.write_all(&buf[..n]).await;
             }
+            server_end.shutdown().await.unwrap();
         });
 
-        // Write some data to the client
-        let mut client_clone = client_end;
-        tokio::spawn(async move {
-            let _ = client_clone.write_all(b"hello").await;
-            let _ = client_clone.shutdown().await;
-        });
+        let (tx, _rx) = mpsc::channel(10);
+        let conn = ActiveConnection::new(Ipv4Addr::new(1, 1, 1, 1), ConnectionId::new(1), tx);
+        let stats = conn.stats();
+        let result = pipe(conn, client, server).await;
 
-        let result = pipe(client, server).await;
+        let (bytes_from_client, bytes_from_server) = result.expect("pipe to succeed");
+        // copy_bidirectional returns (bytes read from first, bytes read from second)
+        // - bytes_from_client = 4 (the "hell" echo written by server_end)
+        // - bytes_from_server = 5 (the "hello" written by client_end)
+        assert_eq!(bytes_from_client, 4);
+        assert_eq!(bytes_from_server, 5);
+        assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), bytes_from_client);
+        assert_eq!(
+            stats.bytes_received.load(Ordering::Relaxed),
+            bytes_from_server
+        );
 
-        match result {
-            PipeResult::Completed { stats }
-            | PipeResult::ClientClosed { stats }
-            | PipeResult::ServerClosed { stats } => {
-                assert!(stats.total_bytes() > 0);
-            }
-            PipeResult::Error { error, .. } => {
-                panic!("Pipe failed: {}", error);
-            }
-        }
+        // Wait for both tasks to complete
+        server_task.await.unwrap();
+        let response = client_task.await.unwrap();
+        assert_eq!(response, b"hell"); // "hello" minus 1 byte
     }
 }

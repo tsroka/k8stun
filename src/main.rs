@@ -18,16 +18,24 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
+use crate::dns::build_servfail_response;
+use crate::stack::{AcceptedConnection, UdpPacket};
 use dns::DnsHandler;
 use dns_intercept::DnsInterceptor;
 use dns_resolver::{DnsResolver, DnsResolverConfig};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use k8s::{K8sClient, PodEndpoint};
 use pipe::pipe;
 use stack::NetworkStack;
 use std::time::Duration;
+use tokio::select;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Notify;
 use tun::{TunConfig, TunDevice};
 use vip::{PodId, ServiceId, TargetId, VipManager, VipManagerConfig};
 
@@ -153,7 +161,10 @@ async fn main() -> Result<()> {
             Ok(services) => {
                 for svc in services {
                     let service_id = ServiceId::new(&svc.name, &svc.namespace);
-                    match vip_manager.get_or_allocate_vip_for_target(TargetId::Service(service_id.clone())).await {
+                    match vip_manager
+                        .get_or_allocate_vip_for_target(TargetId::Service(service_id.clone()))
+                        .await
+                    {
                         Ok(vip) => {
                             info!(
                                 "  {} -> {}.{} (ports: {:?})",
@@ -177,7 +188,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
 
     // Create TUN device
     info!("Creating TUN device...");
@@ -261,9 +271,8 @@ async fn main() -> Result<()> {
     };
 
     info!("Initializing userspace network stack...");
-
     // Initialize network stack with optional DNS resolver
-    let mut network_stack = NetworkStack::new(async_device, vip_manager.clone(), dns_resolver)
+    let network_stack = NetworkStack::new(async_device)
         .await
         .context("Failed to initialize network stack")?;
 
@@ -329,23 +338,144 @@ async fn main() -> Result<()> {
     info!("Press Ctrl+C to stop.");
     info!("");
 
-    // Set up graceful shutdown
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
+    let shutdown_notify = Arc::new(Notify::new());
 
+    let (tcp, udp_rx, udp_tx) = network_stack.split();
+    let components = FuturesUnordered::new();
+
+    let tcp_shutdown = shutdown_notify.clone();
+    let tcp_loop_handle = tokio::spawn(async move {
+        tcp_loop(k8s_client, vip_manager, tcp, tcp_shutdown).await;
+        info!("TCP loop stopped");
+    });
+    components.push(tcp_loop_handle);
+    let udp_shutdown = shutdown_notify.clone();
+
+    let udp_loop_handle = tokio::spawn(async move {
+        udp_loop(udp_tx, udp_rx, dns_resolver, udp_shutdown).await;
+        info!("UDP loop stopped");
+    });
+    components.push(udp_loop_handle);
+
+    let mut sig_int = signal(SignalKind::interrupt()).unwrap(); // Ctrl+C
+    let mut sig_term = signal(SignalKind::terminate()).unwrap(); // Docker stop
+
+    select! {
+        _ = sig_int.recv() => info!("Received SIGINT (Ctrl+C)"),
+        _ = sig_term.recv() => info!("Received SIGTERM"),
+    }
+    shutdown_notify.notify_waiters();
+    info!("Shutting down...");
+    let _res: Vec<_> = components.collect().await;
+
+    // Cleanup DNS interception
+    if let Some(mut interceptor) = dns_interceptor {
+        if let Err(e) = interceptor.disable() {
+            warn!("Failed to disable DNS interception: {}", e);
+        }
+    }
+
+    info!("k8stun stopped");
+    Ok(())
+}
+
+async fn dns_responder(
+    udp_packet: UdpPacket,
+    dns_resolver: &DnsResolver,
+    udp_tx: &mut Sender<UdpPacket>,
+) -> Result<()> {
+    let resp = match dns_resolver.resolve(&udp_packet.payload).await {
+        Ok(response) => response.to_vec(),
+        Err(e) => {
+            debug!("DNS handling error: {}", e);
+            // Send SERVFAIL response so client doesn't hang
+            let response = build_servfail_response(&udp_packet.payload);
+            response.to_vec()
+        }
+    };
+
+    match resp {
+        Ok(payload) => {
+            udp_tx
+                .send(UdpPacket {
+                    src_addr: udp_packet.dst_addr,
+                    dst_addr: udp_packet.src_addr,
+                    payload,
+                })
+                .await?;
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to serialize DNS response: {}", e);
+            Ok(())
+        }
+    }
+}
+
+async fn udp_loop(
+    mut udp_rx: Receiver<UdpPacket>,
+    mut udp_tx: Sender<UdpPacket>,
+    dns_resolver: Option<Arc<DnsResolver>>,
+    shutdown: Arc<Notify>,
+) {
+    loop {
+        tokio::select! {
+            // Handle new TCP connections
+            Some(udp_packet) = udp_rx.recv() => {
+
+                if udp_packet.dst_addr.port() == 53 {
+                    if let Some(ref dns_resolver) = dns_resolver {
+                     let res = dns_responder(udp_packet, dns_resolver, &mut udp_tx).await;
+                            if let Err(e) = res {
+                                error!("Failed to respond to DNS: {}", e);
+                                break;
+                            }
+                    }
+
+                }
+            }
+            _ = shutdown.notified() => {
+                break;
+            }
+        }
+    }
+    info!("Shutting down udp loop...");
+}
+async fn tcp_loop(
+    k8s_client: Arc<K8sClient>,
+    vip_manager: VipManager,
+    mut tcp: Receiver<AcceptedConnection>,
+    shutdown: Arc<Notify>,
+) {
     // Main connection handling loop
     loop {
         tokio::select! {
             // Handle new TCP connections
-            Some(connection) = network_stack.accept() => {
-                let target = connection.target;
+            Some(connection) = tcp.recv() => {
+
                 let stream = connection.stream;
-                let vip = connection.vip;
-                let port = connection.port;
+                let dst_ip = connection.dst_ip;
+                let port = connection.dst_port;
                 let src_addr = stream.local_addr;
                 let k8s = Arc::clone(&k8s_client);
                 let vip_mgr = vip_manager.clone();
 
+                if !vip_manager.is_vip(dst_ip) {
+                    debug!("Destination {} is not a VIP, refusing connection", dst_ip);
+                    // lwip's TcpStream sends RST on drop if not closed, so just drop it
+                    drop(stream);
+                    continue;
+                }
+                       // Look up the target (service or pod)
+                let target = match vip_manager.lookup_target(dst_ip).await {
+                    Some(target) => target,
+                    None => {
+                        warn!("No target found for VIP {}, refusing connection", dst_ip);
+                        // lwip's TcpStream sends RST on drop if not closed, so just drop it
+                        drop(stream);
+                        continue;
+                    }
+                };
                 info!(
                     "New connection to {}.{}:{} from {}",
                     target.name(), target.namespace(), port, stream.peer_addr
@@ -353,12 +483,13 @@ async fn main() -> Result<()> {
 
                 // Spawn a task to handle the connection
                 tokio::spawn(async move {
+
                     // Register the connection with VipManager to track it
                     // The guard will automatically unregister when dropped
-                    let _active_conn = match vip_mgr.register_connection(vip, src_addr, port).await {
+                    let active_conn = match vip_mgr.register_connection(dst_ip, src_addr, port).await {
                         Some(guard) => guard,
                         None => {
-                            error!("Failed to register connection for VIP {}", vip);
+                            error!("Failed to register connection for VIP {}", dst_ip);
                             return;
                         }
                     };
@@ -421,41 +552,19 @@ async fn main() -> Result<()> {
                         }
                     };
 
-                    let result = pipe(stream, k8s_stream).await;
-
-                    // Update byte counters on the active connection before logging
-                    let update_stats = |stats: &pipe::PipeStats| {
-                        _active_conn.add_bytes_sent(stats.bytes_to_server.load(std::sync::atomic::Ordering::Relaxed));
-                        _active_conn.add_bytes_received(stats.bytes_to_client.load(std::sync::atomic::Ordering::Relaxed));
-                    };
+                    let result = pipe(active_conn, stream, k8s_stream).await;
 
                     match result {
-                        pipe::PipeResult::Completed { stats } => {
-                            update_stats(&stats);
+                        Ok((tx_bytes, rx_bytes)) => {
                             info!(
-                                "Connection completed: {} ({} bytes)",
-                                label, stats.total_bytes()
+                                "Connection completed: {} (tx: {} bytes, rx: {} bytes)",
+                                label, tx_bytes, rx_bytes
                             );
                         }
-                        pipe::PipeResult::ClientClosed { stats } => {
-                            update_stats(&stats);
+                       Err(err) => {
                             info!(
-                                "Client closed: {} ({} bytes)",
-                                label, stats.total_bytes()
-                            );
-                        }
-                        pipe::PipeResult::ServerClosed { stats } => {
-                            update_stats(&stats);
-                            info!(
-                                "Server closed: {} ({} bytes)",
-                                label, stats.total_bytes()
-                            );
-                        }
-                        pipe::PipeResult::Error { error, stats } => {
-                            update_stats(&stats);
-                            warn!(
-                                "Connection error: {} - {} ({} bytes)",
-                                label, error, stats.total_bytes()
+                                "Connection error: {} - {}",
+                                label, err
                             );
                         }
                     }
@@ -464,23 +573,13 @@ async fn main() -> Result<()> {
             }
 
             // Handle shutdown signal
-            _ = &mut shutdown => {
-                info!("");
-                info!("Shutting down...");
+            _ = shutdown.notified() => {
+
                 break;
             }
         }
     }
-
-    // Cleanup DNS interception
-    if let Some(mut interceptor) = dns_interceptor {
-        if let Err(e) = interceptor.disable() {
-            warn!("Failed to disable DNS interception: {}", e);
-        }
-    }
-
-    info!("k8stun stopped");
-    Ok(())
+    info!("Shutting down tcp loop...");
 }
 
 /// Gets a pod endpoint based on the PodId.

@@ -4,8 +4,6 @@
 //! 1. Detecting the system's DNS server
 //! 2. Routing DNS server traffic through the TUN device
 
-
-
 use anyhow::{anyhow, Context, Result};
 use std::net::Ipv4Addr;
 use std::process::Command;
@@ -55,7 +53,6 @@ impl DnsInterceptor {
         let config = DnsInterceptConfig {
             system_dns,
             bind_interface,
-            ..Default::default()
         };
 
         Ok(Self {
@@ -274,5 +271,4 @@ mod tests {
         assert!(!is_in_vip_range(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(!is_in_vip_range(Ipv4Addr::new(192, 168, 1, 1)));
     }
-    
 }

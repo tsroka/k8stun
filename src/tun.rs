@@ -3,8 +3,6 @@
 //! This module handles creating a virtual network interface (TUN device)
 //! and configuring OS-level routing to direct traffic to it.
 
-
-
 use anyhow::{Context, Result};
 use std::net::Ipv4Addr;
 use std::process::Command;

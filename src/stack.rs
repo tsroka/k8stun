@@ -3,21 +3,14 @@
 //! This module wraps the lwip crate to provide TCP connection handling
 //! in userspace, allowing us to terminate connections locally.
 
-
-
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use lwip::{NetStack, TcpListener, UdpSocket};
+use lwip::{NetStack, TcpListener, UdpRecvHalf, UdpSendHalf};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use tun2::AsyncDevice;
-
-use crate::dns::build_servfail_response;
-use crate::dns_resolver::DnsResolver;
-use crate::vip::{TargetId, VipManager};
 
 /// A TCP stream from the userspace stack.
 pub struct TcpStream {
@@ -25,6 +18,13 @@ pub struct TcpStream {
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
 }
+
+pub struct UdpPacket {
+    pub src_addr: SocketAddr,
+    pub dst_addr: SocketAddr,
+    pub payload: Vec<u8>,
+}
+
 #[allow(dead_code)]
 impl TcpStream {
     pub fn into_split(self) -> (impl AsyncRead, impl AsyncWrite) {
@@ -73,29 +73,28 @@ impl AsyncWrite for TcpStream {
 /// Information about an accepted TCP connection.
 pub struct AcceptedConnection {
     pub stream: TcpStream,
-    pub target: TargetId,
-    /// The destination VIP address.
-    pub vip: std::net::Ipv4Addr,
+    /// The destination  address.
+    pub dst_ip: std::net::Ipv4Addr,
     /// The destination port from the intercepted connection.
-    pub port: u16,
+    pub dst_port: u16,
 }
 
 /// The userspace network stack that handles TCP connections.
 pub struct NetworkStack {
-    #[allow(dead_code)]
-    vip_manager: VipManager,
     /// Channel to receive accepted TCP connections.
-    connection_rx: mpsc::Receiver<AcceptedConnection>,
+    pub tcp_rx: mpsc::Receiver<AcceptedConnection>,
+    /// Channel to receive accepted UDP packets.
+    pub udp_received_rx: mpsc::Receiver<UdpPacket>,
+    // Channel to send UDP packets
+    pub udp_send_tx: mpsc::Sender<UdpPacket>,
 }
 
 impl NetworkStack {
     /// Creates a new network stack using the given TUN device.
-    pub async fn new(
-        device: AsyncDevice,
-        vip_manager: VipManager,
-        dns_resolver: Option<Arc<DnsResolver>>,
-    ) -> Result<Self> {
-        let (connection_tx, connection_rx) = mpsc::channel(64);
+    pub async fn new(device: AsyncDevice) -> Result<Self> {
+        let (udp_received_tx, udp_received_rx) = mpsc::channel(64);
+        let (udp_send_tx, udp_send_rx) = mpsc::channel(64);
+        let (tcp_tx, tcp_rx) = mpsc::channel(64);
 
         // Build the lwIP stack with TCP and UDP support
         let (stack, tcp_listener, udp_socket) =
@@ -105,36 +104,42 @@ impl NetworkStack {
         tokio::spawn(run_tun_stack_bridge(device, stack));
 
         // Spawn the TCP connection handling task
-        let vip_manager_clone = vip_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_tcp_listener(tcp_listener, vip_manager_clone, connection_tx).await {
+            if let Err(e) = run_tcp_listener(tcp_listener, tcp_tx).await {
                 error!("TCP listener error: {}", e);
             }
         });
 
         // Spawn the UDP/DNS handling task
-        if let Some(resolver) = dns_resolver {
-            info!("DNS resolver enabled");
-            tokio::spawn(async move {
-                if let Err(e) = run_udp_handler(udp_socket, resolver).await {
-                    error!("UDP handler error: {}", e);
-                }
-            });
-        } else {
-            info!("DNS resolver not configured, UDP packets will not be handled");
-        }
+        let (udp_writer, udp_reader) = udp_socket.split();
+
+        tokio::spawn(async move {
+            if let Err(e) = run_udp_rx_handler(udp_reader, udp_received_tx).await {
+                error!("UDP handler error: {}", e);
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = run_udp_tx_handler(udp_writer, udp_send_rx).await {
+                error!("UDP handler error: {}", e);
+            }
+        });
 
         info!("Network stack started, waiting for connections...");
 
         Ok(Self {
-            vip_manager,
-            connection_rx,
+            tcp_rx,
+            udp_received_rx,
+            udp_send_tx,
         })
     }
-
-    /// Accepts the next TCP connection from the stack.
-    pub async fn accept(&mut self) -> Option<AcceptedConnection> {
-        self.connection_rx.recv().await
+    pub fn split(
+        self,
+    ) -> (
+        mpsc::Receiver<AcceptedConnection>,
+        mpsc::Sender<UdpPacket>,
+        mpsc::Receiver<UdpPacket>,
+    ) {
+        (self.tcp_rx, self.udp_send_tx, self.udp_received_rx)
     }
 }
 
@@ -201,7 +206,6 @@ async fn run_tun_stack_bridge(device: AsyncDevice, stack: NetStack) {
 /// Main loop that accepts TCP connections from the TCP listener.
 async fn run_tcp_listener(
     mut tcp_listener: TcpListener,
-    vip_manager: VipManager,
     connection_tx: mpsc::Sender<AcceptedConnection>,
 ) -> Result<()> {
     // TcpListener is a Stream that yields (TcpStream, local_addr, remote_addr)
@@ -221,25 +225,6 @@ async fn run_tcp_listener(
 
         let dst_port = peer_addr.port();
 
-        // Check if this is a VIP
-        if !vip_manager.is_vip(dst_ip) {
-            debug!("Destination {} is not a VIP, refusing connection", dst_ip);
-            // lwip's TcpStream sends RST on drop if not closed, so just drop it
-            drop(tcp_stream);
-            continue;
-        }
-
-        // Look up the target (service or pod)
-        let target = match vip_manager.lookup_target(dst_ip).await {
-            Some(target) => target,
-            None => {
-                warn!("No target found for VIP {}, refusing connection", dst_ip);
-                // lwip's TcpStream sends RST on drop if not closed, so just drop it
-                drop(tcp_stream);
-                continue;
-            }
-        };
-
         let stream = TcpStream {
             inner: tcp_stream,
             local_addr,
@@ -248,9 +233,8 @@ async fn run_tcp_listener(
 
         let connection = AcceptedConnection {
             stream,
-            target,
-            vip: dst_ip,
-            port: dst_port,
+            dst_ip,
+            dst_port,
         };
 
         if let Err(e) = connection_tx.send(connection).await {
@@ -258,54 +242,48 @@ async fn run_tcp_listener(
             break;
         }
     }
-
+    warn!("TCP listener closed");
     Ok(())
 }
 
 /// Handles UDP packets, primarily for DNS resolution.
-async fn run_udp_handler(udp_socket: Box<UdpSocket>, dns_resolver: Arc<DnsResolver>) -> Result<()> {
-    let (udp_writer, mut udp_reader) = udp_socket.split();
+async fn run_udp_rx_handler(
+    mut udp_reader: UdpRecvHalf,
+    client_udp_receive_tx: mpsc::Sender<UdpPacket>,
+) -> Result<()> {
+    info!("UDP receive handler started...");
 
     // Process incoming UDP packets
     while let Some((payload, src_addr, dst_addr)) = udp_reader.next().await {
         trace!("UDP packet: {} -> {}", src_addr, dst_addr);
-
-        // Check if this is a DNS query (port 53)
-        if dst_addr.port() == 53 {
-            // Use the DnsResolver to handle the query
-            match dns_resolver.resolve(&payload).await {
-                Ok(response) => {
-                    // Serialize and send response back: swap src and dst addresses
-                    match response.to_vec() {
-                        Ok(bytes) => {
-                            if let Err(e) = udp_writer.send_to(&bytes, &dst_addr, &src_addr) {
-                                debug!("Failed to send DNS response: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Failed to serialize DNS response: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("DNS handling error: {}", e);
-                    // Send SERVFAIL response so client doesn't hang
-                    let response = build_servfail_response(&payload);
-                    match response.to_vec() {
-                        Ok(bytes) => {
-                            if let Err(e) = udp_writer.send_to(&bytes, &dst_addr, &src_addr) {
-                                debug!("Failed to send SERVFAIL response: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Failed to serialize SERVFAIL response: {}", e);
-                        }
-                    }
-                }
-            }
+        let packet = UdpPacket {
+            src_addr,
+            dst_addr,
+            payload,
+        };
+        if let Err(e) = client_udp_receive_tx.send(packet).await {
+            error!("Failed to send connection to handler: {}", e);
+            break;
         }
     }
-
+    warn!("UDP receive handler closed");
     Ok(())
 }
 
+async fn run_udp_tx_handler(
+    udp_writer: UdpSendHalf,
+    mut udp_receive_rx: mpsc::Receiver<UdpPacket>,
+) -> Result<()> {
+    info!("UDP transmit handler started...");
+
+    // Process incoming UDP packets
+    while let Some(udp_packet) = udp_receive_rx.recv().await {
+        udp_writer.send_to(
+            &udp_packet.payload,
+            &udp_packet.src_addr,
+            &udp_packet.dst_addr,
+        )?;
+    }
+    warn!("UDP transmit handler closed");
+    Ok(())
+}

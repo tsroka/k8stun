@@ -5,7 +5,6 @@
 //! - Pod endpoint resolution
 //! - Port-forwarding to pods
 
-
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -98,7 +97,6 @@ impl K8sClient {
             rr_index: DashMap::new(),
         })
     }
-
 
     /// Lists all services in the given namespaces.
     pub async fn list_services(&self, namespaces: &[String]) -> Result<Vec<ServiceInfo>> {
@@ -423,7 +421,6 @@ pub struct ServiceInfo {
     pub namespace: String,
     pub ports: Vec<u16>,
 }
-
 
 /// Watches all Kubernetes namespaces and maintains an up-to-date set of namespace names.
 pub struct NamespaceWatcher {

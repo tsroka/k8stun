@@ -5,8 +5,6 @@
 //! It uses an actor pattern with message passing for thread-safe state management,
 //! and tracks active connections with RAII guards for automatic cleanup.
 
-
-
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -84,6 +82,15 @@ impl TargetId {
     }
 }
 
+impl std::fmt::Display for TargetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetId::Service(s) => write!(f, "svc/{}.{}", s.name, s.namespace),
+            TargetId::Pod(p) => write!(f, "pod/{}.{}", p.name, p.namespace),
+        }
+    }
+}
+
 impl ServiceId {
     pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
         Self {
@@ -105,7 +112,7 @@ pub struct ConnectionId {
 }
 
 impl ConnectionId {
-    fn new(id: u64) -> Self {
+    pub fn new(id: u64) -> Self {
         Self { id }
     }
 }
@@ -247,9 +254,16 @@ pub struct ActiveConnection {
     sender: mpsc::Sender<VipMessage>,
     stats: Arc<VipStats>,
 }
-
+#[allow(dead_code)]
 impl ActiveConnection {
-
+    pub fn new(vip: Ipv4Addr, conn_id: ConnectionId, sender: mpsc::Sender<VipMessage>) -> Self {
+        Self {
+            vip,
+            conn_id,
+            sender,
+            stats: Arc::new(Default::default()),
+        }
+    }
     /// Adds to the bytes sent counter. Updates are immediately visible to VipManager.
     pub fn add_bytes_sent(&self, n: u64) {
         self.stats.add_bytes_sent(n);
@@ -258,6 +272,10 @@ impl ActiveConnection {
     /// Adds to the bytes received counter. Updates are immediately visible to VipManager.
     pub fn add_bytes_received(&self, n: u64) {
         self.stats.add_bytes_received(n);
+    }
+
+    pub fn stats(&self) -> Arc<VipStats> {
+        self.stats.clone()
     }
 }
 
@@ -282,7 +300,7 @@ impl Drop for ActiveConnection {
 // Actor Messages
 // ============================================================================
 
-enum VipMessage {
+pub enum VipMessage {
     // Allocation (request/response)
     GetOrAllocateVip {
         target: TargetId,
@@ -877,12 +895,16 @@ impl VipManager {
     pub async fn lookup_vip(&self, service: &ServiceId) -> Option<Ipv4Addr> {
         // This is a workaround - we allocate to get/lookup
         // In a production system, you'd add a dedicated lookup message
-        self.get_or_allocate_vip_for_target(TargetId::Service(service.clone())).await.ok()
+        self.get_or_allocate_vip_for_target(TargetId::Service(service.clone()))
+            .await
+            .ok()
     }
 
     /// Looks up the VIP associated with a pod.
     pub async fn lookup_vip_for_pod(&self, pod: &PodId) -> Option<Ipv4Addr> {
-        self.get_or_allocate_vip_for_target(TargetId::Pod(pod.clone())).await.ok()
+        self.get_or_allocate_vip_for_target(TargetId::Pod(pod.clone()))
+            .await
+            .ok()
     }
 
     /// Registers a new connection to the given VIP.
@@ -969,7 +991,8 @@ impl VipManager {
     /// Pre-allocates VIPs for a list of services.
     pub async fn pre_allocate(&self, services: Vec<ServiceId>) -> Result<()> {
         for service in services {
-            self.get_or_allocate_vip_for_target(TargetId::Service(service)).await?;
+            self.get_or_allocate_vip_for_target(TargetId::Service(service))
+                .await?;
         }
         Ok(())
     }
@@ -1016,8 +1039,14 @@ mod tests {
         let svc1 = ServiceId::new("svc1", "default");
         let svc2 = ServiceId::new("svc2", "default");
 
-        let vip1 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc1.clone())).await.unwrap();
-        let vip2 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc2.clone())).await.unwrap();
+        let vip1 = manager
+            .get_or_allocate_vip_for_target(TargetId::Service(svc1.clone()))
+            .await
+            .unwrap();
+        let vip2 = manager
+            .get_or_allocate_vip_for_target(TargetId::Service(svc2.clone()))
+            .await
+            .unwrap();
 
         // Should get different VIPs
         assert_ne!(vip1, vip2);
@@ -1027,7 +1056,10 @@ mod tests {
         assert_eq!(vip2, Ipv4Addr::new(198, 18, 0, 3));
 
         // Same service should return same VIP
-        let vip1_again = manager.get_or_allocate_vip_for_target(TargetId::Service(svc1)).await.unwrap();
+        let vip1_again = manager
+            .get_or_allocate_vip_for_target(TargetId::Service(svc1))
+            .await
+            .unwrap();
         assert_eq!(vip1, vip1_again);
     }
 
@@ -1070,7 +1102,10 @@ mod tests {
         let svc = ServiceId::new("mysql", "default");
         let pod = PodId::new("mysql-0", "default");
 
-        let svc_vip = manager.get_or_allocate_vip_for_target(TargetId::Service(svc.clone())).await.unwrap();
+        let svc_vip = manager
+            .get_or_allocate_vip_for_target(TargetId::Service(svc.clone()))
+            .await
+            .unwrap();
         let pod_vip = manager
             .get_or_allocate_vip_for_target(TargetId::Pod(pod.clone()))
             .await
@@ -1113,7 +1148,10 @@ mod tests {
         let manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
 
         let svc = ServiceId::new("test-svc", "default");
-        let vip = manager.get_or_allocate_vip_for_target(TargetId::Service(svc)).await.unwrap();
+        let vip = manager
+            .get_or_allocate_vip_for_target(TargetId::Service(svc))
+            .await
+            .unwrap();
 
         // Create test source addresses
         let src1 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345));
@@ -1176,7 +1214,10 @@ mod tests {
         });
 
         let svc1 = ServiceId::new("svc1", "default");
-        let vip1 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc1)).await.unwrap();
+        let vip1 = manager
+            .get_or_allocate_vip_for_target(TargetId::Service(svc1))
+            .await
+            .unwrap();
         assert_eq!(vip1, Ipv4Addr::new(198, 18, 0, 2));
 
         // Wait for cleanup
@@ -1184,7 +1225,10 @@ mod tests {
 
         // VIP should be recycled, next allocation should get same VIP
         let svc2 = ServiceId::new("svc2", "default");
-        let vip2 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc2)).await.unwrap();
+        let vip2 = manager
+            .get_or_allocate_vip_for_target(TargetId::Service(svc2))
+            .await
+            .unwrap();
         assert_eq!(vip2, Ipv4Addr::new(198, 18, 0, 2)); // Recycled!
     }
 }
