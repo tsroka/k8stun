@@ -5,7 +5,7 @@
 //! It uses an actor pattern with message passing for thread-safe state management,
 //! and tracks active connections with RAII guards for automatic cleanup.
 
-#![allow(dead_code)]
+
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 
 // ============================================================================
 // Public Types (ServiceId, PodId, TargetId) - unchanged from original
@@ -56,11 +56,6 @@ impl PodId {
             namespace: namespace.into(),
         }
     }
-
-    /// Returns the full DNS name for this pod (IP-based format).
-    pub fn dns_name(&self) -> String {
-        format!("{}.{}.pod.cluster.local", self.name, self.namespace)
-    }
 }
 
 /// Unified target identifier that can be either a service or a pod.
@@ -87,16 +82,6 @@ impl TargetId {
             TargetId::Pod(p) => &p.name,
         }
     }
-
-    /// Returns true if this is a service target.
-    pub fn is_service(&self) -> bool {
-        matches!(self, TargetId::Service(_))
-    }
-
-    /// Returns true if this is a pod target.
-    pub fn is_pod(&self) -> bool {
-        matches!(self, TargetId::Pod(_))
-    }
 }
 
 impl ServiceId {
@@ -105,40 +90,6 @@ impl ServiceId {
             name: name.into(),
             namespace: namespace.into(),
         }
-    }
-
-    /// Parses a service identifier from a DNS-like name.
-    /// Supports formats like:
-    /// - `service.namespace`
-    /// - `service.namespace.svc.cluster.local`
-    pub fn from_dns_name(name: &str) -> Option<Self> {
-        let name = name.trim_end_matches('.');
-
-        // Try to parse as service.namespace.svc.cluster.local
-        if let Some(stripped) = name.strip_suffix(".svc.cluster.local") {
-            let parts: Vec<&str> = stripped.splitn(2, '.').collect();
-            if parts.len() == 2 {
-                return Some(Self::new(parts[0], parts[1]));
-            }
-        }
-
-        // Try to parse as service.namespace
-        let parts: Vec<&str> = name.splitn(2, '.').collect();
-        if parts.len() == 2 {
-            return Some(Self::new(parts[0], parts[1]));
-        }
-
-        None
-    }
-
-    /// Returns the full DNS name for this service.
-    pub fn dns_name(&self) -> String {
-        format!("{}.{}.svc.cluster.local", self.name, self.namespace)
-    }
-
-    /// Returns a short DNS name (service.namespace).
-    pub fn short_dns_name(&self) -> String {
-        format!("{}.{}", self.name, self.namespace)
     }
 }
 
@@ -298,15 +249,6 @@ pub struct ActiveConnection {
 }
 
 impl ActiveConnection {
-    /// Returns the VIP this connection is associated with.
-    pub fn vip(&self) -> Ipv4Addr {
-        self.vip
-    }
-
-    /// Returns a reference to the shared stats.
-    pub fn stats(&self) -> &Arc<VipStats> {
-        &self.stats
-    }
 
     /// Adds to the bytes sent counter. Updates are immediately visible to VipManager.
     pub fn add_bytes_sent(&self, n: u64) {
@@ -332,7 +274,7 @@ impl Drop for ActiveConnection {
             conn_id: self.conn_id.clone(),
         });
 
-        trace!("ActiveConnection dropped for VIP {}", self.vip);
+        debug!("ActiveConnection dropped for VIP {}", self.vip);
     }
 }
 
@@ -442,9 +384,6 @@ struct VipManagerActor {
 
     /// Message receiver.
     receiver: mpsc::Receiver<VipMessage>,
-
-    /// Sender clone for ActiveConnection guards.
-    sender: mpsc::Sender<VipMessage>,
 
     /// Broadcast sender for real-time updates.
     update_tx: broadcast::Sender<VipUpdate>,
@@ -842,7 +781,7 @@ pub struct VipManager {
     base_ip: Ipv4Addr,
     max_ips: u32,
 }
-
+#[allow(dead_code)]
 impl VipManager {
     /// Creates a new VIP manager with the given base IP and default configuration.
     pub fn new(base_ip: Ipv4Addr) -> Self {
@@ -876,7 +815,6 @@ impl VipManager {
             stale_heap: BinaryHeap::new(),
             next_conn_id: 1,
             receiver,
-            sender: sender.clone(),
             update_tx: update_tx.clone(),
             stale_timeout: config.stale_timeout,
             cleanup_interval: config.cleanup_interval,
@@ -894,18 +832,6 @@ impl VipManager {
             base_ip: config.base_ip,
             max_ips: 65534,
         }
-    }
-
-    /// Allocates or retrieves a VIP for the given service.
-    pub async fn get_or_allocate_vip(&self, service: ServiceId) -> Result<Ipv4Addr> {
-        self.get_or_allocate_vip_for_target(TargetId::Service(service))
-            .await
-    }
-
-    /// Allocates or retrieves a VIP for the given pod.
-    pub async fn get_or_allocate_vip_for_pod(&self, pod: PodId) -> Result<Ipv4Addr> {
-        self.get_or_allocate_vip_for_target(TargetId::Pod(pod))
-            .await
     }
 
     /// Allocates or retrieves a VIP for the given target (service or pod).
@@ -951,12 +877,12 @@ impl VipManager {
     pub async fn lookup_vip(&self, service: &ServiceId) -> Option<Ipv4Addr> {
         // This is a workaround - we allocate to get/lookup
         // In a production system, you'd add a dedicated lookup message
-        self.get_or_allocate_vip(service.clone()).await.ok()
+        self.get_or_allocate_vip_for_target(TargetId::Service(service.clone())).await.ok()
     }
 
     /// Looks up the VIP associated with a pod.
     pub async fn lookup_vip_for_pod(&self, pod: &PodId) -> Option<Ipv4Addr> {
-        self.get_or_allocate_vip_for_pod(pod.clone()).await.ok()
+        self.get_or_allocate_vip_for_target(TargetId::Pod(pod.clone())).await.ok()
     }
 
     /// Registers a new connection to the given VIP.
@@ -1043,7 +969,7 @@ impl VipManager {
     /// Pre-allocates VIPs for a list of services.
     pub async fn pre_allocate(&self, services: Vec<ServiceId>) -> Result<()> {
         for service in services {
-            self.get_or_allocate_vip(service).await?;
+            self.get_or_allocate_vip_for_target(TargetId::Service(service)).await?;
         }
         Ok(())
     }
@@ -1066,32 +992,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_service_id_from_dns_name() {
-        let svc = ServiceId::from_dns_name("backend.default").unwrap();
-        assert_eq!(svc.name, "backend");
-        assert_eq!(svc.namespace, "default");
-
-        let svc = ServiceId::from_dns_name("api.production.svc.cluster.local").unwrap();
-        assert_eq!(svc.name, "api");
-        assert_eq!(svc.namespace, "production");
-    }
-
-    #[test]
-    fn test_service_id_dns_names() {
-        let svc = ServiceId::new("backend", "default");
-        assert_eq!(svc.dns_name(), "backend.default.svc.cluster.local");
-        assert_eq!(svc.short_dns_name(), "backend.default");
-    }
-
-    #[test]
-    fn test_pod_id() {
-        let pod = PodId::new("mysql-0", "default");
-        assert_eq!(pod.name, "mysql-0");
-        assert_eq!(pod.namespace, "default");
-        assert_eq!(pod.dns_name(), "mysql-0.default.pod.cluster.local");
-    }
-
-    #[test]
     fn test_target_id() {
         let svc = ServiceId::new("backend", "default");
         let pod = PodId::new("mysql-0", "default");
@@ -1099,13 +999,12 @@ mod tests {
         let target_svc = TargetId::Service(svc.clone());
         let target_pod = TargetId::Pod(pod.clone());
 
-        assert!(target_svc.is_service());
-        assert!(!target_svc.is_pod());
+        assert!(matches!(target_svc, TargetId::Service(_)));
         assert_eq!(target_svc.name(), "backend");
         assert_eq!(target_svc.namespace(), "default");
 
-        assert!(target_pod.is_pod());
-        assert!(!target_pod.is_service());
+        assert!(matches!(target_pod, TargetId::Pod(_)));
+
         assert_eq!(target_pod.name(), "mysql-0");
         assert_eq!(target_pod.namespace(), "default");
     }
@@ -1117,8 +1016,8 @@ mod tests {
         let svc1 = ServiceId::new("svc1", "default");
         let svc2 = ServiceId::new("svc2", "default");
 
-        let vip1 = manager.get_or_allocate_vip(svc1.clone()).await.unwrap();
-        let vip2 = manager.get_or_allocate_vip(svc2.clone()).await.unwrap();
+        let vip1 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc1.clone())).await.unwrap();
+        let vip2 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc2.clone())).await.unwrap();
 
         // Should get different VIPs
         assert_ne!(vip1, vip2);
@@ -1128,7 +1027,7 @@ mod tests {
         assert_eq!(vip2, Ipv4Addr::new(198, 18, 0, 3));
 
         // Same service should return same VIP
-        let vip1_again = manager.get_or_allocate_vip(svc1).await.unwrap();
+        let vip1_again = manager.get_or_allocate_vip_for_target(TargetId::Service(svc1)).await.unwrap();
         assert_eq!(vip1, vip1_again);
     }
 
@@ -1140,11 +1039,11 @@ mod tests {
         let pod2 = PodId::new("mysql-1", "default");
 
         let vip1 = manager
-            .get_or_allocate_vip_for_pod(pod1.clone())
+            .get_or_allocate_vip_for_target(TargetId::Pod(pod1.clone()))
             .await
             .unwrap();
         let vip2 = manager
-            .get_or_allocate_vip_for_pod(pod2.clone())
+            .get_or_allocate_vip_for_target(TargetId::Pod(pod2.clone()))
             .await
             .unwrap();
 
@@ -1153,7 +1052,7 @@ mod tests {
 
         // Same pod should return same VIP
         let vip1_again = manager
-            .get_or_allocate_vip_for_pod(pod1.clone())
+            .get_or_allocate_vip_for_target(TargetId::Pod(pod1.clone()))
             .await
             .unwrap();
         assert_eq!(vip1, vip1_again);
@@ -1171,9 +1070,9 @@ mod tests {
         let svc = ServiceId::new("mysql", "default");
         let pod = PodId::new("mysql-0", "default");
 
-        let svc_vip = manager.get_or_allocate_vip(svc.clone()).await.unwrap();
+        let svc_vip = manager.get_or_allocate_vip_for_target(TargetId::Service(svc.clone())).await.unwrap();
         let pod_vip = manager
-            .get_or_allocate_vip_for_pod(pod.clone())
+            .get_or_allocate_vip_for_target(TargetId::Pod(pod.clone()))
             .await
             .unwrap();
 
@@ -1214,7 +1113,7 @@ mod tests {
         let manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
 
         let svc = ServiceId::new("test-svc", "default");
-        let vip = manager.get_or_allocate_vip(svc).await.unwrap();
+        let vip = manager.get_or_allocate_vip_for_target(TargetId::Service(svc)).await.unwrap();
 
         // Create test source addresses
         let src1 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345));
@@ -1277,7 +1176,7 @@ mod tests {
         });
 
         let svc1 = ServiceId::new("svc1", "default");
-        let vip1 = manager.get_or_allocate_vip(svc1).await.unwrap();
+        let vip1 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc1)).await.unwrap();
         assert_eq!(vip1, Ipv4Addr::new(198, 18, 0, 2));
 
         // Wait for cleanup
@@ -1285,7 +1184,7 @@ mod tests {
 
         // VIP should be recycled, next allocation should get same VIP
         let svc2 = ServiceId::new("svc2", "default");
-        let vip2 = manager.get_or_allocate_vip(svc2).await.unwrap();
+        let vip2 = manager.get_or_allocate_vip_for_target(TargetId::Service(svc2)).await.unwrap();
         assert_eq!(vip2, Ipv4Addr::new(198, 18, 0, 2)); // Recycled!
     }
 }

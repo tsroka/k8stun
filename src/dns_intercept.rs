@@ -4,7 +4,7 @@
 //! 1. Detecting the system's DNS server
 //! 2. Routing DNS server traffic through the TUN device
 
-#![allow(dead_code)]
+
 
 use anyhow::{anyhow, Context, Result};
 use std::net::Ipv4Addr;
@@ -19,8 +19,6 @@ pub struct DnsInterceptConfig {
     /// The network interface name to bind to when forwarding DNS.
     /// This ensures forwarded queries bypass the TUN.
     pub bind_interface: String,
-    /// Port for DNS (usually 53).
-    pub dns_port: u16,
 }
 
 impl Default for DnsInterceptConfig {
@@ -28,7 +26,6 @@ impl Default for DnsInterceptConfig {
         Self {
             system_dns: Ipv4Addr::new(0, 0, 0, 0), // Will be detected
             bind_interface: String::new(),         // Will be detected
-            dns_port: 53,
         }
     }
 }
@@ -277,11 +274,5 @@ mod tests {
         assert!(!is_in_vip_range(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(!is_in_vip_range(Ipv4Addr::new(192, 168, 1, 1)));
     }
-
-    #[test]
-    fn test_default_config() {
-        let config = DnsInterceptConfig::default();
-        assert_eq!(config.dns_port, 53);
-        // system_dns and bind_ip are detected at runtime
-    }
+    
 }

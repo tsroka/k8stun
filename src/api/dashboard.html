@@ -305,6 +305,36 @@
       cursor: default;
     }
 
+    .connections-table tbody tr.connection-disconnected {
+      opacity: 0.5;
+      background: rgba(248, 81, 73, 0.08);
+    }
+
+    .connections-table tbody tr.connection-disconnected td {
+      text-decoration: line-through;
+      text-decoration-color: var(--accent-red);
+    }
+
+    .connection-status-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      text-decoration: none !important;
+    }
+
+    .connection-status-active {
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--accent-green);
+    }
+
+    .connection-status-disconnected {
+      background: rgba(248, 81, 73, 0.15);
+      color: var(--accent-red);
+    }
+
     .no-connections {
       color: var(--text-muted);
       font-style: italic;
@@ -669,14 +699,23 @@
         return '<div class="no-connections">No active connections</div>';
       }
 
-      const rows = connections.map(c => `
-        <tr>
-          <td>${escapeHtml(c.src_ip)}</td>
-          <td>${c.src_port}</td>
-          <td>${c.dst_port}</td>
-          <td>${timeWithTooltip(c.created_at)}</td>
-        </tr>
-      `).join('');
+      const rows = connections.map(c => {
+        const isDisconnected = !!c.disconnected_at;
+        const rowClass = isDisconnected ? 'connection-disconnected' : '';
+        const statusBadge = isDisconnected 
+          ? '<span class="connection-status-badge connection-status-disconnected">Closed</span>'
+          : '<span class="connection-status-badge connection-status-active">Active</span>';
+        
+        return `
+          <tr class="${rowClass}">
+            <td>${escapeHtml(c.src_ip)}</td>
+            <td>${c.src_port}</td>
+            <td>${c.dst_port}</td>
+            <td>${statusBadge}</td>
+            <td>${timeWithTooltip(c.created_at)}</td>
+          </tr>
+        `;
+      }).join('');
 
       return `
         <table class="connections-table">
@@ -685,6 +724,7 @@
               <th>Source IP</th>
               <th>Source Port</th>
               <th>Dest Port</th>
+              <th>Status</th>
               <th>Connected</th>
             </tr>
           </thead>
@@ -741,6 +781,10 @@
 
     // Initialize table from snapshot
     function initTable(vips) {
+      // Clear any pending removal timeouts
+      pendingRemovals.forEach(timeoutId => clearTimeout(timeoutId));
+      pendingRemovals.clear();
+
       vipData.clear();
       vipTableBody.innerHTML = '';
 
@@ -790,8 +834,28 @@
       updateStats();
     }
 
+    // Map to track pending removal timeouts for disconnected connections
+    const pendingRemovals = new Map(); // key: "vip:src_ip:src_port:dst_port" -> timeoutId
+
+    // Generate a unique key for a connection
+    function connectionKey(vipAddr, conn) {
+      return `${vipAddr}:${conn.src_ip}:${conn.src_port}:${conn.dst_port}`;
+    }
+
     // Remove VIP row
     function removeRow(vipAddr) {
+      // Cancel any pending removal timeouts for connections of this VIP
+      const vip = vipData.get(vipAddr);
+      if (vip && vip.connections) {
+        vip.connections.forEach(conn => {
+          const key = connectionKey(vipAddr, conn);
+          if (pendingRemovals.has(key)) {
+            clearTimeout(pendingRemovals.get(key));
+            pendingRemovals.delete(key);
+          }
+        });
+      }
+
       vipData.delete(vipAddr);
 
       const escapedVip = CSS.escape(vipAddr);
@@ -809,6 +873,41 @@
         // Row doesn't exist in DOM, just update stats
         updateStats();
       }
+    }
+
+    // Remove a disconnected connection after delay
+    function scheduleConnectionRemoval(vipAddr, connection) {
+      const key = connectionKey(vipAddr, connection);
+      
+      // If already scheduled, don't reschedule (idempotent)
+      if (pendingRemovals.has(key)) {
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        pendingRemovals.delete(key);
+        
+        const vip = vipData.get(vipAddr);
+        if (!vip) return;
+
+        // Remove the connection from the list
+        vip.connections = vip.connections.filter(c => 
+          !(c.src_ip === connection.src_ip && 
+            c.src_port === connection.src_port && 
+            c.dst_port === connection.dst_port)
+        );
+
+        // Update the connections sub-table
+        const connRow = document.getElementById(`connections-${vipAddr}`);
+        if (connRow) {
+          const wrapper = connRow.querySelector('.connections-wrapper');
+          if (wrapper) {
+            wrapper.innerHTML = renderConnectionsTable(vip.connections);
+          }
+        }
+      }, 60000); // 1 minute
+
+      pendingRemovals.set(key, timeoutId);
     }
 
     // Update connection counts
@@ -836,13 +935,44 @@
       // Update connections list
       // Note: event_type is serialized as snake_case by Rust serde
       if (event.event_type === 'connected') {
-        vip.connections.push(event.connection);
-      } else if (event.event_type === 'disconnected') {
-        vip.connections = vip.connections.filter(c => 
-          !(c.src_ip === event.connection.src_ip && 
-            c.src_port === event.connection.src_port && 
-            c.dst_port === event.connection.dst_port)
+        // Cancel any pending removal for this connection (reconnect case)
+        const key = connectionKey(event.vip, event.connection);
+        if (pendingRemovals.has(key)) {
+          clearTimeout(pendingRemovals.get(key));
+          pendingRemovals.delete(key);
+        }
+
+        // Check if connection already exists (might be marked as disconnected)
+        const existingIdx = vip.connections.findIndex(c => 
+          c.src_ip === event.connection.src_ip && 
+          c.src_port === event.connection.src_port && 
+          c.dst_port === event.connection.dst_port
         );
+
+        if (existingIdx >= 0) {
+          // Update existing connection, clear disconnected status
+          vip.connections[existingIdx] = { ...event.connection, disconnected_at: null };
+        } else {
+          // Add new connection
+          vip.connections.push(event.connection);
+        }
+      } else if (event.event_type === 'disconnected') {
+        // Find the connection and mark it as disconnected instead of removing
+        const conn = vip.connections.find(c => 
+          c.src_ip === event.connection.src_ip && 
+          c.src_port === event.connection.src_port && 
+          c.dst_port === event.connection.dst_port
+        );
+
+        if (conn) {
+          // Only mark as disconnected if not already marked (idempotent)
+          if (!conn.disconnected_at) {
+            conn.disconnected_at = new Date().toISOString();
+            // Schedule removal after 1 minute
+            scheduleConnectionRemoval(event.vip, event.connection);
+          }
+          // If already marked as disconnected, the timeout is already scheduled
+        }
       }
 
       // Update DOM - use escaped selector for VIP addresses

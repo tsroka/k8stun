@@ -3,7 +3,7 @@
 //! This module handles creating a virtual network interface (TUN device)
 //! and configuring OS-level routing to direct traffic to it.
 
-#![allow(dead_code)]
+
 
 use anyhow::{Context, Result};
 use std::net::Ipv4Addr;
@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use tun2::AsyncDevice;
 
 /// Configuration for the TUN device.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TunConfig {
     /// Name of the TUN device (e.g., "utun8" on macOS).
@@ -44,7 +45,7 @@ pub struct TunDevice {
     device: Option<AsyncDevice>,
     config: TunConfig,
 }
-
+#[allow(dead_code)]
 impl TunDevice {
     /// Creates a new TUN device with the given configuration.
     ///

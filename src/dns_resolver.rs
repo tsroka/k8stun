@@ -24,11 +24,11 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::dns::{build_formerr_response, DnsHandler, DnsQuery, K8sQueryType, PodDnsInfo};
 use crate::k8s::K8sClient;
-use crate::vip::{PodId, ServiceId, VipManager};
+use crate::vip::{PodId, ServiceId, TargetId, VipManager};
 
 #[cfg(target_os = "macos")]
 use std::{ffi::CString, num::NonZeroU32};
@@ -291,70 +291,70 @@ impl DnsResolver {
         };
 
         let query_names: Vec<_> = query.questions().iter().map(|q| q.name.clone()).collect();
-        debug!("DNS query for: {:?}", query_names);
+        trace!("DNS query for: {:?}", query_names);
 
         // Parse the query to determine if it's a K8s service, pod, or external
-        match self.dns_handler.parse_k8s_query(&query) {
+        let target_id = match self.dns_handler.parse_k8s_query(&query) {
             K8sQueryType::Service { name, namespace } => {
-                self.resolve_service(&query, &name, &namespace).await
+                self.resolve_service(&name, &namespace).await
             }
-            K8sQueryType::Pod(pod_info) => self.resolve_pod(&query, pod_info).await,
+            K8sQueryType::Pod(pod_info) => self.resolve_pod(pod_info).await,
             K8sQueryType::NotK8s => {
                 trace!("Not intercepting DNS query for {:?}", query_names);
-                self.forward_query(&query, &query_names).await
+                return self.forward_query(&query, &query_names).await
             }
-        }
+        };
+        let Some(target_id)  = target_id else  {
+                return Ok(query.build_error_response(ResponseCode::NXDomain));
+        };
+
+        // Get or allocate a VIP for this pod (only after validation)
+        let vip = match self.vip_manager.get_or_allocate_vip_for_target(target_id.clone()).await {
+            Ok(vip) => vip,
+            Err(e) => {
+                warn!("Failed to allocate VIP for target {:?}: {}", target_id, e);
+                return Ok(query.build_error_response(ResponseCode::ServFail));
+            }
+        };
+
+        info!("k8s DNS resolution: {:?} -> {}", target_id, vip);
+
+        Ok(query.build_response(vip))
     }
 
     /// Resolves a service DNS query, validating it exists before allocating a VIP.
     async fn resolve_service(
         &self,
-        query: &DnsQuery,
         service_name: &str,
         namespace: &str,
-    ) -> Result<Message> {
+    ) -> Option<TargetId> {
         // Validate that the service exists in Kubernetes before allocating a VIP
         let service = ServiceId::new(service_name, namespace);
         if let Err(e) = self.k8s_client.get_service_endpoints(&service).await {
-            debug!(
+            info!(
                 "Service {}.{} not found in K8s: {}",
                 service_name, namespace, e
             );
-            return Ok(query.build_error_response(ResponseCode::NXDomain));
+            return None;
         }
+        Some(TargetId::Service(service))
 
-        // Get or allocate a VIP for this service (only after validation)
-        let vip = match self.vip_manager.get_or_allocate_vip(service).await {
-            Ok(vip) => vip,
-            Err(e) => {
-                debug!(
-                    "Failed to allocate VIP for {}.{}: {}",
-                    service_name, namespace, e
-                );
-                return Ok(query.build_error_response(ResponseCode::ServFail));
-            }
-        };
-
-        info!("DNS: {}.{} -> {}", service_name, namespace, vip);
-        Ok(query.build_response(vip))
     }
 
     /// Resolves a pod DNS query, validating it exists before allocating a VIP.
-    async fn resolve_pod(&self, query: &DnsQuery, pod_info: PodDnsInfo) -> Result<Message> {
+    async fn resolve_pod(&self, pod_info: PodDnsInfo) -> Option<TargetId> {
         // Validate pod exists in Kubernetes and create PodId based on the pod info type
-        let (pod_id, log_name) = match &pod_info {
+        let pod_id= match &pod_info {
             PodDnsInfo::Ip { ip, namespace } => {
                 // Validate pod exists by IP before allocating VIP
                 let ip_str = ip.to_string();
                 if let Err(e) = self.k8s_client.get_pod_by_ip(&ip_str, namespace).await {
                     debug!("Pod with IP {} not found in {}: {}", ip, namespace, e);
-                    return Ok(query.build_error_response(ResponseCode::NXDomain));
+                    return None;
                 }
                 let pod_name = ip_str.replace('.', "-");
-                (
-                    PodId::new(&pod_name, namespace),
-                    format!("{}.{}.pod", ip, namespace),
-                )
+
+                    PodId::new(&pod_name, namespace)
             }
             PodDnsInfo::StatefulSet {
                 pod_name,
@@ -363,13 +363,11 @@ impl DnsResolver {
             } => {
                 // Validate StatefulSet pod exists before allocating VIP
                 if let Err(e) = self.k8s_client.get_pod_by_name(pod_name, namespace).await {
-                    debug!("Pod {} not found in {}: {}", pod_name, namespace, e);
-                    return Ok(query.build_error_response(ResponseCode::NXDomain));
+                    info!("Pod {} not found in {}: {}", pod_name, namespace, e);
+                    return None;
                 }
-                (
-                    PodId::new(pod_name, namespace),
-                    format!("{}.{}", pod_name, namespace),
-                )
+
+                    PodId::new(pod_name, namespace)
             }
             PodDnsInfo::Hostname {
                 hostname,
@@ -382,31 +380,20 @@ impl DnsResolver {
                     .get_pod_by_hostname(hostname, subdomain, namespace)
                     .await
                 {
-                    debug!(
+                    info!(
                         "Pod with hostname {}.{} not found in {}: {}",
                         hostname, subdomain, namespace, e
                     );
-                    return Ok(query.build_error_response(ResponseCode::NXDomain));
+                    return None;
                 }
                 let pod_name = format!("{}.{}", hostname, subdomain);
-                (
-                    PodId::new(&pod_name, namespace),
-                    format!("{}.{}.{}", hostname, subdomain, namespace),
-                )
+
+                    PodId::new(&pod_name, namespace)
+
             }
         };
+       Some(TargetId::Pod(pod_id))
 
-        // Get or allocate a VIP for this pod (only after validation)
-        let vip = match self.vip_manager.get_or_allocate_vip_for_pod(pod_id).await {
-            Ok(vip) => vip,
-            Err(e) => {
-                debug!("Failed to allocate VIP for pod {}: {}", log_name, e);
-                return Ok(query.build_error_response(ResponseCode::ServFail));
-            }
-        };
-
-        info!("DNS (pod): {} -> {}", log_name, vip);
-        Ok(query.build_response(vip))
     }
 
     /// Forwards a parsed query to the upstream DNS server using hickory-resolver.
@@ -416,12 +403,12 @@ impl DnsResolver {
         let question = match questions.first() {
             Some(q) => q,
             None => {
-                debug!("No questions in query, returning empty response");
+                trace!("No questions in query, returning empty response");
                 return Ok(query.build_empty_response());
             }
         };
 
-        debug!(
+        trace!(
             "Forwarding {:?} query for {} to upstream",
             question.qtype, question.name
         );
@@ -433,7 +420,7 @@ impl DnsResolver {
             .await
         {
             Ok(lookup) => {
-                debug!(
+                trace!(
                     "Upstream resolved {:?} for {} with {} records",
                     query_names,
                     question.name,
@@ -455,7 +442,7 @@ impl DnsResolver {
                     hickory_proto::op::ResponseCode::ServFail
                 };
 
-                debug!(
+                trace!(
                     "Upstream DNS resolution failed for {}: {} (returning {:?})",
                     question.name, e, rcode
                 );

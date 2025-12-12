@@ -5,7 +5,6 @@
 //! - Pod endpoint resolution
 //! - Port-forwarding to pods
 
-#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
@@ -17,6 +16,7 @@ use kube::{
     Client, Config,
 };
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -43,7 +43,11 @@ pub struct PodEndpoint {
     pub namespace: String,
     pub ip: String,
 }
-
+impl Display for PodEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{} -> {}", self.name, self.namespace, self.ip)
+    }
+}
 /// Kubernetes client wrapper with service discovery capabilities.
 pub struct K8sClient {
     client: Client,
@@ -95,24 +99,6 @@ impl K8sClient {
         })
     }
 
-    /// Creates a Kubernetes client with a specific kubeconfig path.
-    pub async fn with_kubeconfig(path: &str) -> Result<Self> {
-        let config = Config::from_kubeconfig(&kube::config::KubeConfigOptions {
-            context: None,
-            cluster: None,
-            user: None,
-        })
-        .await
-        .context(format!("Failed to load kubeconfig from {}", path))?;
-
-        let client = Client::try_from(config)?;
-
-        Ok(Self {
-            client,
-            endpoint_cache: DashMap::new(),
-            rr_index: DashMap::new(),
-        })
-    }
 
     /// Lists all services in the given namespaces.
     pub async fn list_services(&self, namespaces: &[String]) -> Result<Vec<ServiceInfo>> {
@@ -283,37 +269,6 @@ impl K8sClient {
         Ok(stream)
     }
 
-    /// Establishes a port-forward and returns split read/write halves.
-    pub async fn port_forward_split(
-        &self,
-        endpoint: &PodEndpoint,
-        port: u16,
-    ) -> Result<(impl AsyncRead + Unpin, impl AsyncWrite + Unpin)> {
-        let stream = self.port_forward(endpoint, port).await?;
-        Ok(tokio::io::split(stream))
-    }
-
-    /// Clears the endpoint cache for a service.
-    pub async fn invalidate_cache(&self, service: &ServiceId) {
-        let key = ServiceKey {
-            name: service.name.clone(),
-            namespace: service.namespace.clone(),
-        };
-
-        self.endpoint_cache.remove(&key);
-
-        debug!(
-            "Invalidated cache for {}/{}",
-            service.namespace, service.name
-        );
-    }
-
-    /// Clears all cached endpoints.
-    pub async fn clear_cache(&self) {
-        self.endpoint_cache.clear();
-        info!("Cleared all endpoint cache");
-    }
-
     /// Finds a pod by its IP address.
     ///
     /// This is used for IP-based pod DNS resolution (e.g., 172-17-0-3.namespace.pod.cluster.local).
@@ -459,64 +414,6 @@ impl K8sClient {
         // hostname matching their name)
         self.get_pod_by_name(hostname, namespace).await
     }
-
-    /// Watches for service changes in the given namespaces.
-    pub async fn watch_services<F>(&self, namespaces: Vec<String>, on_change: F) -> Result<()>
-    where
-        F: Fn(ServiceEvent) + Send + Sync + Clone + 'static,
-    {
-        use kube::runtime::watcher;
-
-        for namespace in namespaces {
-            let api: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
-            let watcher = watcher(api, watcher::Config::default());
-
-            let namespace_clone = namespace.clone();
-            let on_change_clone = on_change.clone();
-            tokio::spawn(async move {
-                let mut stream = watcher.boxed();
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(watcher::Event::Apply(svc)) => {
-                            if let Some(name) = svc.metadata.name {
-                                on_change_clone(ServiceEvent::Added {
-                                    name,
-                                    namespace: namespace_clone.clone(),
-                                });
-                            }
-                        }
-                        Ok(watcher::Event::Delete(svc)) => {
-                            if let Some(name) = svc.metadata.name {
-                                on_change_clone(ServiceEvent::Deleted {
-                                    name,
-                                    namespace: namespace_clone.clone(),
-                                });
-                            }
-                        }
-                        Ok(watcher::Event::Init) => {
-                            debug!("Service watcher initialized for {}", namespace_clone);
-                        }
-                        Ok(watcher::Event::InitApply(svc)) => {
-                            if let Some(name) = svc.metadata.name {
-                                on_change_clone(ServiceEvent::Added {
-                                    name,
-                                    namespace: namespace_clone.clone(),
-                                });
-                            }
-                        }
-                        Ok(watcher::Event::InitDone) => {
-                            debug!("Service watcher init done for {}", namespace_clone);
-                        }
-                        Err(e) => {
-                            warn!("Service watcher error: {}", e);
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(())
-    }
 }
 
 /// Information about a discovered Kubernetes service.
@@ -527,12 +424,6 @@ pub struct ServiceInfo {
     pub ports: Vec<u16>,
 }
 
-/// Events from the service watcher.
-#[derive(Debug, Clone)]
-pub enum ServiceEvent {
-    Added { name: String, namespace: String },
-    Deleted { name: String, namespace: String },
-}
 
 /// Watches all Kubernetes namespaces and maintains an up-to-date set of namespace names.
 pub struct NamespaceWatcher {

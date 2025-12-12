@@ -3,7 +3,7 @@
 //! This module wraps the lwip crate to provide TCP connection handling
 //! in userspace, allowing us to terminate connections locally.
 
-#![allow(dead_code)]
+
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
@@ -25,7 +25,7 @@ pub struct TcpStream {
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
 }
-
+#[allow(dead_code)]
 impl TcpStream {
     pub fn into_split(self) -> (impl AsyncRead, impl AsyncWrite) {
         tokio::io::split(self.inner)
@@ -309,28 +309,3 @@ async fn run_udp_handler(udp_socket: Box<UdpSocket>, dns_resolver: Arc<DnsResolv
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vip::ServiceId;
-
-    #[test]
-    fn test_service_id_creation() {
-        let service = ServiceId::new("backend", "default");
-        assert_eq!(service.name, "backend");
-        assert_eq!(service.namespace, "default");
-    }
-
-    #[test]
-    fn test_target_id() {
-        use crate::vip::PodId;
-
-        let svc_target = TargetId::Service(ServiceId::new("backend", "default"));
-        assert!(svc_target.is_service());
-        assert!(!svc_target.is_pod());
-
-        let pod_target = TargetId::Pod(PodId::new("mysql-0", "default"));
-        assert!(pod_target.is_pod());
-        assert!(!pod_target.is_service());
-    }
-}

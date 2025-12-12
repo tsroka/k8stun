@@ -51,10 +51,6 @@ struct Args {
     #[arg(long, default_value = "true")]
     auto_discover: bool,
 
-    /// Specific services to expose (format: service.namespace:port)
-    #[arg(short, long)]
-    services: Vec<String>,
-
     /// Log level for k8stun (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
     log_level: String,
@@ -157,7 +153,7 @@ async fn main() -> Result<()> {
             Ok(services) => {
                 for svc in services {
                     let service_id = ServiceId::new(&svc.name, &svc.namespace);
-                    match vip_manager.get_or_allocate_vip(service_id.clone()).await {
+                    match vip_manager.get_or_allocate_vip_for_target(TargetId::Service(service_id.clone())).await {
                         Ok(vip) => {
                             info!(
                                 "  {} -> {}.{} (ports: {:?})",
@@ -182,26 +178,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Pre-allocate VIPs for explicitly specified services
-    for service_spec in &args.services {
-        // Support both "service.namespace" and "service.namespace:port" formats
-        // Port is ignored for VIP allocation (same VIP for all ports)
-        let service_part = service_spec
-            .rsplit_once(':')
-            .map(|(s, _)| s)
-            .unwrap_or(service_spec);
-
-        if let Some(service_id) = ServiceId::from_dns_name(service_part) {
-            match vip_manager.get_or_allocate_vip(service_id.clone()).await {
-                Ok(vip) => {
-                    info!("Pre-allocated {} -> {:?}", vip, service_id);
-                }
-                Err(e) => {
-                    warn!("Failed to pre-allocate VIP: {}", e);
-                }
-            }
-        }
-    }
 
     // Create TUN device
     info!("Creating TUN device...");
