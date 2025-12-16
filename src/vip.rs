@@ -254,8 +254,8 @@ pub struct ActiveConnection {
     sender: mpsc::Sender<VipMessage>,
     stats: Arc<VipStats>,
 }
-#[allow(dead_code)]
 impl ActiveConnection {
+    #[allow(dead_code)]
     pub fn new(vip: Ipv4Addr, conn_id: ConnectionId, sender: mpsc::Sender<VipMessage>) -> Self {
         Self {
             vip,
@@ -274,6 +274,7 @@ impl ActiveConnection {
         self.stats.add_bytes_received(n);
     }
 
+    #[allow(dead_code)]
     pub fn stats(&self) -> Arc<VipStats> {
         self.stats.clone()
     }

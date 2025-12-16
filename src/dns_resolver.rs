@@ -377,27 +377,6 @@ impl DnsResolver {
 
                 PodId::new(pod_name, namespace)
             }
-            PodDnsInfo::Hostname {
-                hostname,
-                subdomain,
-                namespace,
-            } => {
-                // Validate pod with hostname/subdomain exists before allocating VIP
-                if let Err(e) = self
-                    .k8s_client
-                    .get_pod_by_hostname(hostname, subdomain, namespace)
-                    .await
-                {
-                    info!(
-                        "Pod with hostname {}.{} not found in {}: {}",
-                        hostname, subdomain, namespace, e
-                    );
-                    return None;
-                }
-                let pod_name = format!("{}.{}", hostname, subdomain);
-
-                PodId::new(&pod_name, namespace)
-            }
         };
         Some(TargetId::Pod(pod_id))
     }

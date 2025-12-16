@@ -11,10 +11,10 @@ use tracing::{debug, info, warn};
 use tun2::AsyncDevice;
 
 /// Configuration for the TUN device.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TunConfig {
     /// Name of the TUN device (e.g., "utun8" on macOS).
+    #[allow(dead_code)]
     pub name: Option<String>,
     /// IP address to assign to the TUN device.
     pub address: Ipv4Addr,

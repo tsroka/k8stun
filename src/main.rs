@@ -6,6 +6,8 @@
 
 mod api;
 mod dns;
+#[cfg(target_os = "macos")]
+mod dns_forward_macos;
 mod dns_intercept;
 mod dns_resolver;
 mod k8s;
@@ -24,7 +26,9 @@ use tracing_subscriber::{fmt, EnvFilter};
 use crate::dns::build_servfail_response;
 use crate::stack::{AcceptedConnection, UdpPacket};
 use dns::DnsHandler;
-use dns_intercept::DnsInterceptor;
+#[cfg(target_os = "macos")]
+use dns_forward_macos::DnsForwarder;
+use dns_intercept::{detect_default_interface_name, detect_system_dns, DnsInterceptor, DnsMode};
 use dns_resolver::{DnsResolver, DnsResolverConfig};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -79,11 +83,12 @@ struct Args {
     #[arg(long, default_value = "300")]
     idle_timeout: u64,
 
-    /// Intercept DNS traffic from the system's DNS server.
-    /// When enabled, DNS queries are routed through the TUN device.
-    /// K8s service queries are resolved to VIPs, others are forwarded to the original DNS.
-    #[arg(long, default_value = "true")]
-    intercept_dns: bool,
+    /// DNS interception mode:
+    /// - disabled: No DNS interception
+    /// - tun_route: Route DNS traffic through TUN device (works on all platforms)
+    /// - forward: Change system DNS settings to use our DNS server (macOS only)
+    #[arg(long, default_value = "tun_route", value_enum)]
+    dns_mode: dns_intercept::DnsMode,
 
     /// Kubernetes context to use (from kubeconfig). If not specified, uses current context.
     #[arg(short = 'c', long)]
@@ -210,64 +215,60 @@ async fn main() -> Result<()> {
         .into_async_device()
         .context("Failed to extract async device from TUN")?;
 
-    // Set up DNS interception if enabled
+
+    // Set up DNS based on mode
     let mut dns_interceptor: Option<DnsInterceptor> = None;
-    let dns_resolver: Option<Arc<DnsResolver>> = if args.intercept_dns {
-        info!("Setting up DNS interception...");
-        match DnsInterceptor::new(tun_name.clone()) {
-            Ok(mut interceptor) => match interceptor.enable() {
-                Ok(()) => {
-                    info!(
-                        "DNS interception enabled: {} -> TUN (forward via interface '{}')",
-                        interceptor.system_dns(),
-                        interceptor.bind_interface()
-                    );
+    #[cfg(target_os = "macos")]
+    let mut dns_forwarder: Option<DnsForwarder> = None;
+    let dns_resolver: Option<Arc<DnsResolver>> = match args.dns_mode {
+        DnsMode::Disabled => {
+            info!("DNS interception is disabled");
+            None
+        }
+        DnsMode::TunRoute => {
+            info!("Setting up DNS interception (tun_route mode)...");
+            setup_dns_tun_route(
+                tun_name.clone(),
+                &dns_handler,
+                &vip_manager,
+                &k8s_client,
+                &mut dns_interceptor,
+            )
+            .await
+        }
+        #[cfg(target_os = "macos")]
+        DnsMode::Forward => {
 
-                    // Create the DNS resolver with upstream configuration
-                    let resolver_config = DnsResolverConfig {
-                        upstream_dns: interceptor.system_dns(),
-                        bind_interface: interceptor.bind_interface().to_string(),
-                    };
+            {
+                info!("Setting up DNS forwarding (forward mode)...");
+                // TUN interface IP address (used for DNS server)
+                let tun_ip = Ipv4Addr::new(args.vip_base.octets()[0], args.vip_base.octets()[1], 0, 1);
 
-                    match DnsResolver::new(
-                        resolver_config,
-                        Arc::clone(&dns_handler),
-                        vip_manager.clone(),
-                        Arc::clone(&k8s_client),
-                    )
-                    .await
-                    {
-                        Ok(resolver) => {
-                            dns_interceptor = Some(interceptor);
-                            Some(Arc::new(resolver))
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to create DNS resolver: {}. Continuing without it.",
-                                e
-                            );
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to enable DNS interception: {}. Continuing without it.",
-                        e
-                    );
-                    None
-                }
-            },
-            Err(e) => {
+                setup_dns_forward(
+                    tun_ip,
+                    tun_name.clone(),
+                    &dns_handler,
+                    &vip_manager,
+                    &k8s_client,
+                    &mut dns_forwarder,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
                 warn!(
-                    "Failed to set up DNS interceptor: {}. Continuing without it.",
-                    e
+                    "DNS forward mode is only supported on macOS. Falling back to tun_route mode."
                 );
-                None
+                setup_dns_tun_route(
+                    tun_name.clone(),
+                    &dns_handler,
+                    &vip_manager,
+                    &k8s_client,
+                    &mut dns_interceptor,
+                )
+                .await
             }
         }
-    } else {
-        None
     };
 
     info!("Initializing userspace network stack...");
@@ -306,9 +307,13 @@ async fn main() -> Result<()> {
         info!("  (services will be resolved via DNS on first access)");
     }
 
-    if dns_interceptor.is_some() {
+    let dns_active = dns_resolver.is_some();
+    if dns_active {
         info!("");
-        info!("DNS interception is ACTIVE. You can use service and pod names directly:");
+        info!(
+            "DNS interception is ACTIVE ({} mode). You can use service and pod names directly:",
+            args.dns_mode
+        );
         info!("  curl http://backend.default/");
         info!("  curl http://api.production:8080/");
         info!("");
@@ -317,7 +322,7 @@ async fn main() -> Result<()> {
         info!("  curl http://172-17-0-3.default.pod/            # Pod by IP");
     } else {
         info!("");
-        info!("DNS interception is OFF. Use --intercept-dns to enable.");
+        info!("DNS interception is OFF. Use --dns-mode=tun_route to enable.");
         info!("Without it, use the VIP addresses directly.");
     }
 
@@ -357,8 +362,8 @@ async fn main() -> Result<()> {
     });
     components.push(udp_loop_handle);
 
-    let mut sig_int = signal(SignalKind::interrupt()).unwrap(); // Ctrl+C
-    let mut sig_term = signal(SignalKind::terminate()).unwrap(); // Docker stop
+    let mut sig_int = signal(SignalKind::interrupt()).unwrap();
+    let mut sig_term = signal(SignalKind::terminate()).unwrap();
 
     select! {
         _ = sig_int.recv() => info!("Received SIGINT (Ctrl+C)"),
@@ -375,8 +380,177 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Cleanup DNS forwarder (macOS forward mode)
+    #[cfg(target_os = "macos")]
+    if let Some(mut forwarder) = dns_forwarder {
+        if let Err(e) = forwarder.disable() {
+            warn!("Failed to disable DNS forwarder: {}", e);
+        }
+    }
+
     info!("k8stun stopped");
     Ok(())
+}
+
+/// Sets up DNS in TunRoute mode (routes DNS traffic through TUN).
+async fn setup_dns_tun_route(
+    tun_name: String,
+    dns_handler: &Arc<DnsHandler>,
+    vip_manager: &VipManager,
+    k8s_client: &Arc<K8sClient>,
+    dns_interceptor: &mut Option<DnsInterceptor>,
+) -> Option<Arc<DnsResolver>> {
+    match DnsInterceptor::new(tun_name) {
+        Ok(mut interceptor) => match interceptor.enable() {
+            Ok(()) => {
+                info!(
+                    "DNS interception enabled: {} -> TUN (forward via interface '{}')",
+                    interceptor.system_dns(),
+                    interceptor.bind_interface()
+                );
+
+                // Create the DNS resolver with upstream configuration
+                let resolver_config = DnsResolverConfig {
+                    upstream_dns: interceptor.system_dns(),
+                    bind_interface: interceptor.bind_interface().to_string(),
+                };
+
+                match DnsResolver::new(
+                    resolver_config,
+                    Arc::clone(dns_handler),
+                    vip_manager.clone(),
+                    Arc::clone(k8s_client),
+                )
+                .await
+                {
+                    Ok(resolver) => {
+                        *dns_interceptor = Some(interceptor);
+                        Some(Arc::new(resolver))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create DNS resolver: {}. Continuing without it.",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to enable DNS interception: {}. Continuing without it.",
+                    e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                "Failed to set up DNS interceptor: {}. Continuing without it.",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Sets up DNS in Forward mode (changes system DNS settings to point to our server).
+#[cfg(target_os = "macos")]
+/// DNS port - always use standard port 53
+const DNS_PORT: u16 = 53;
+
+#[cfg(target_os = "macos")]
+async fn setup_dns_forward(
+    tun_ip: Ipv4Addr,
+    tun_name: String,
+    dns_handler: &Arc<DnsHandler>,
+    vip_manager: &VipManager,
+    k8s_client: &Arc<K8sClient>,
+    dns_forwarder: &mut Option<DnsForwarder>,
+) -> Option<Arc<DnsResolver>> {
+    // Detect system DNS and interface for upstream forwarding
+    let system_dns = match detect_system_dns() {
+        Ok(dns) => {
+            info!("Detected system DNS server: {}", dns);
+            dns
+        }
+        Err(e) => {
+            warn!(
+                "Failed to detect system DNS: {}. Continuing without DNS.",
+                e
+            );
+            return None;
+        }
+    };
+
+    let bind_interface = match detect_default_interface_name() {
+        Ok(iface) => {
+            info!(
+                "Will bind to interface '{}' for upstream DNS forwarding",
+                iface
+            );
+            iface
+        }
+        Err(e) => {
+            warn!(
+                "Failed to detect default interface: {}. Continuing without DNS.",
+                e
+            );
+            return None;
+        }
+    };
+
+    // Create the DNS resolver
+    let resolver_config = DnsResolverConfig {
+        upstream_dns: system_dns,
+        bind_interface,
+    };
+
+    let resolver = match DnsResolver::new(
+        resolver_config,
+        Arc::clone(dns_handler),
+        vip_manager.clone(),
+        Arc::clone(k8s_client),
+    )
+    .await
+    {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            warn!(
+                "Failed to create DNS resolver: {}. Continuing without it.",
+                e
+            );
+            return None;
+        }
+    };
+
+    // Create and enable the DNS forwarder
+    match DnsForwarder::new(tun_ip, DNS_PORT, tun_name) {
+        Ok(mut forwarder) => match forwarder.enable() {
+            Ok(()) => {
+                info!(
+                    "DNS forward mode enabled: system DNS -> {}:{}",
+                    tun_ip, DNS_PORT
+                );
+                *dns_forwarder = Some(forwarder);
+                Some(resolver)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to enable DNS forwarder: {}. Continuing without it.",
+                    e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                "Failed to create DNS forwarder: {}. Continuing without it.",
+                e
+            );
+            None
+        }
+    }
 }
 
 async fn dns_responder(

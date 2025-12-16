@@ -2,12 +2,57 @@
 //!
 //! This module handles intercepting DNS traffic by:
 //! 1. Detecting the system's DNS server
-//! 2. Routing DNS server traffic through the TUN device
+//! 2. Routing DNS server traffic through the TUN device (TunRoute mode)
+//!
+//! For macOS Forward mode, see the `dns_forward_macos` module.
 
 use anyhow::{anyhow, Context, Result};
+use clap::ValueEnum;
 use std::net::Ipv4Addr;
 use std::process::Command;
+use std::str::FromStr;
 use tracing::{debug, info, warn};
+
+/// DNS interception mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum DnsMode {
+    /// DNS interception is disabled.
+    Disabled,
+    /// Route DNS traffic through the TUN device (current behavior).
+    /// Works on all platforms.
+    #[default]
+    TunRoute,
+    /// Change system DNS settings to point to our DNS server (macOS only).
+    /// This modifies the system's DNS configuration via SCDynamicStore.
+    #[cfg(target_os = "macos")]
+    Forward,
+}
+
+impl std::fmt::Display for DnsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DnsMode::Disabled => write!(f, "disabled"),
+            DnsMode::TunRoute => write!(f, "tun_route"),
+            DnsMode::Forward => write!(f, "forward"),
+        }
+    }
+}
+
+impl FromStr for DnsMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "disabled" => Ok(DnsMode::Disabled),
+            "tun_route" | "tunroute" | "tun-route" => Ok(DnsMode::TunRoute),
+            "forward" => Ok(DnsMode::Forward),
+            _ => Err(format!(
+                "Invalid DNS mode: '{}'. Valid options: disabled, tun_route, forward",
+                s
+            )),
+        }
+    }
+}
 
 /// Configuration for DNS interception.
 #[derive(Debug, Clone)]
@@ -185,7 +230,7 @@ impl Drop for DnsInterceptor {
 
 /// Detects the system's primary DNS server.
 #[cfg(target_os = "macos")]
-fn detect_system_dns() -> Result<Ipv4Addr> {
+pub fn detect_system_dns() -> Result<Ipv4Addr> {
     // On macOS, use scutil --dns to get DNS configuration
     let output = Command::new("scutil")
         .args(["--dns"])
@@ -215,7 +260,7 @@ fn detect_system_dns() -> Result<Ipv4Addr> {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_system_dns() -> Result<Ipv4Addr> {
+pub fn detect_system_dns() -> Result<Ipv4Addr> {
     detect_dns_from_resolv_conf()
 }
 
@@ -242,7 +287,7 @@ fn detect_dns_from_resolv_conf() -> Result<Ipv4Addr> {
 
 /// Detects the name of the default network interface.
 /// This interface can be used to bind sockets to bypass TUN routing.
-fn detect_default_interface_name() -> Result<String> {
+pub fn detect_default_interface_name() -> Result<String> {
     let interface = netdev::get_default_interface()
         .map_err(|e| anyhow!("Failed to get default interface: {}", e))?;
 

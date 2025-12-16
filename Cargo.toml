@@ -11,12 +11,18 @@ keywords = ["kubernetes", "networking", "tunnel", "vpn", "k8s"]
 categories = ["network-programming", "command-line-utilities"]
 authors = ["Tomek Sroka"]
 
+[features]
+default = ["stack-smoltcp"]
+stack-lwip = ["dep:lwip"]
+stack-smoltcp = ["dep:netstack-smoltcp"]
+
 [dependencies]
 # TUN device management
 tun2 = { version = "4.0.0", features = ["async"] }
 
-# Userspace TCP/IP stack (lwIP-based)
-lwip = "0.3.15"
+# Userspace TCP/IP stack backends (select via features)
+lwip = { version = "0.3.15", optional = true }
+netstack-smoltcp = { version = "0.2.0", optional = true }
 
 # Kubernetes client
 kube = { version = "0.98.0", features = ["client", "runtime", "ws"] }
@@ -66,6 +72,10 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 itertools = "0.14.0"
 log = "0.4.29"
+
+# macOS-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.6"
 
 [profile.release]
 opt-level = 3

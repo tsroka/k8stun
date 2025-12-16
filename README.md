@@ -89,13 +89,38 @@ Options:
   -n, --namespaces <NAMESPACES>  Kubernetes namespaces to expose (comma-separated) [default: default]
       --vip-base <VIP_BASE>      Virtual IP range base (e.g., 198.18.0.0) [default: 198.18.0.0]
       --auto-discover <BOOL>     Pre-allocate VIPs for all discovered services [default: true]
-  -s, --services <SERVICES>      Specific services to expose (format: service.namespace:port)
   -l, --log-level <LOG_LEVEL>    Log level (trace, debug, info, warn, error) [default: info]
       --mtu <MTU>                MTU for the TUN device [default: 1500]
       --idle-timeout <SECONDS>   Idle connection timeout in seconds (0 = no timeout) [default: 300]
+      --dns-mode <MODE>          DNS interception mode [default: tun_route]
+                                   - disabled: No DNS interception
+                                   - tun_route: Route DNS traffic through TUN device
+                                   - forward: Change system DNS settings (macOS only)
       --http <PORT>              Port for the HTTP API server (0 to disable) [default: 0]
+  -c, --context <CONTEXT>        Kubernetes context to use (from kubeconfig)
   -h, --help                     Print help
   -V, --version                  Print version
+```
+
+### DNS Modes
+
+k8stun supports three DNS interception modes:
+
+| Mode | Description | Platform |
+|------|-------------|----------|
+| `tun_route` | Routes DNS traffic through the TUN device by adding a route to the system's DNS server. This is the default mode. | All |
+| `forward` | Changes macOS system DNS settings to point to a DNS server running on the TUN interface. Original settings are restored on exit. | macOS only |
+| `disabled` | No DNS interception. You must use VIP addresses directly. | All |
+
+```bash
+# Default mode - route DNS through TUN
+sudo k8stun --dns-mode tun_route
+
+# Forward mode on macOS - modify system DNS settings
+sudo k8stun --dns-mode forward
+
+# Disable DNS interception entirely
+sudo k8stun --dns-mode disabled
 ```
 
 ## Example Session
@@ -239,19 +264,20 @@ Events include:
 
 ```
 src/
-├── main.rs          - Entry point, CLI, orchestration
-├── tun.rs           - TUN device creation and OS routing
-├── vip.rs           - Virtual IP pool management (services & pods)
-├── dns.rs           - DNS packet parsing for services and pods
-├── dns_resolver.rs  - DNS resolution with upstream forwarding
-├── dns_intercept.rs - DNS query interception setup
-├── stack.rs         - Userspace TCP/IP stack (lwIP)
-├── k8s.rs           - Kubernetes client, pod lookup, and port-forwarding
-├── pipe.rs          - Bidirectional stream copying
-└── api/             - HTTP API server (optional)
-    ├── mod.rs       - Server setup and routing
-    ├── handlers.rs  - Route handlers (GET /vips, SSE /events)
-    └── types.rs     - API response types
+├── main.rs              - Entry point, CLI, orchestration
+├── tun.rs               - TUN device creation and OS routing
+├── vip.rs               - Virtual IP pool management (services & pods)
+├── dns.rs               - DNS packet parsing for services and pods
+├── dns_resolver.rs      - DNS resolution with upstream forwarding
+├── dns_intercept.rs     - DNS interception via TUN routing
+├── dns_forward_macos.rs - macOS system DNS settings (forward mode)
+├── stack.rs             - Userspace TCP/IP stack (lwIP/smoltcp)
+├── k8s.rs               - Kubernetes client, pod lookup, and port-forwarding
+├── pipe.rs              - Bidirectional stream copying
+└── api/                 - HTTP API server (optional)
+    ├── mod.rs           - Server setup and routing
+    ├── handlers.rs      - Route handlers (GET /vips, SSE /events)
+    └── types.rs         - API response types
 ```
 
 ## Dependencies
@@ -259,14 +285,17 @@ src/
 | Crate | Purpose |
 |-------|---------|
 | `tun2` | Cross-platform TUN device management |
-| `lwip` | Userspace TCP/IP stack (lwIP-based) |
+| `netstack-smoltcp` | Userspace TCP/IP stack (default) |
+| `lwip` | Alternative userspace TCP/IP stack |
 | `kube` | Kubernetes API client |
 | `k8s-openapi` | Kubernetes API types |
 | `tokio` | Async runtime |
 | `clap` | CLI argument parsing |
 | `tracing` | Structured logging |
 | `hickory-proto` | DNS protocol handling |
+| `hickory-resolver` | DNS resolution and forwarding |
 | `etherparse` | Network packet parsing |
+| `system-configuration` | macOS system DNS settings (forward mode) |
 
 ## Limitations
 

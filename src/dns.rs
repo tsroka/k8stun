@@ -297,18 +297,6 @@ pub enum PodDnsInfo {
         /// The namespace.
         namespace: String,
     },
-    /// Pod accessed by hostname and subdomain.
-    /// Pattern: hostname.subdomain.namespace.svc.cluster.local
-    /// Note: Currently treated the same as ByStatefulSet since the DNS pattern is identical.
-    #[allow(dead_code)]
-    Hostname {
-        /// The pod hostname.
-        hostname: String,
-        /// The subdomain (usually a headless service name).
-        subdomain: String,
-        /// The namespace.
-        namespace: String,
-    },
 }
 
 /// Parses a dashed IP address (e.g., "172-17-0-3") to an Ipv4Addr.
