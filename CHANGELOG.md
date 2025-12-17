@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-12-17
+
+### Bug Fixes
+
+- Dns resolution by @tsroka
+- Clippy errors by @tsroka
+
+### Features
+
+- Macos dns forwarding by @tsroka
+
+### Miscellaneous Tasks
+
+- Remove unused code by @tsroka
+- Remove dead code by @tsroka
 ## [0.2.0] - 2025-12-11
 
 ### Bug Fixes
@@ -19,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add HTTP API with VIP snapshot and SSE real-time updates by @tsroka
 - Improve logging by @tsroka
 - Add direct pod DNS resolution support by @tsroka
+
+### Miscellaneous Tasks
+
+- Release v0.2.0 by @github-actions[bot]
 
 ### Refactor
 
