@@ -28,6 +28,8 @@ use system_configuration::dynamic_store::{
 use system_configuration::sys::schema_definitions::{
     kSCPropNetDNSServerAddresses, kSCPropNetDNSServerPort,
 };
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 /// Standard DNS port.
@@ -183,15 +185,15 @@ impl DnsForwarder {
     /// * `dns_server_addr` - The IP address of our DNS server (TUN interface IP)
     /// * `dns_port` - The port our DNS server listens on
     /// * `tun_interface` - The name of the TUN interface
-    pub fn new(dns_server_addr: Ipv4Addr, dns_port: u16, tun_interface: String) -> Result<Self> {
-        Ok(Self {
+    pub fn new(dns_server_addr: Ipv4Addr, dns_port: u16, tun_interface: String) -> Self {
+        Self {
             dns_server_addr,
             dns_port,
             tun_interface,
             state: Arc::new(Mutex::new(ForwarderState::new())),
             monitor_thread: None,
             should_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        })
+        }
     }
 
     /// Enables DNS forwarding by changing system DNS settings.
@@ -200,7 +202,7 @@ impl DnsForwarder {
     /// 1. Backup current DNS settings
     /// 2. Set all network services to use our DNS server
     /// 3. Start monitoring for DNS changes
-    pub fn enable(&mut self) -> Result<()> {
+    pub fn enable(mut self, shutdown_notify: Arc<Notify>) -> Result<JoinHandle<Result<()>>> {
         info!(
             "Enabling DNS forward mode: setting system DNS to {}:{}",
             self.dns_server_addr, self.dns_port
@@ -219,7 +221,20 @@ impl DnsForwarder {
         self.start_monitor()?;
 
         info!("DNS forward mode enabled");
-        Ok(())
+        let handle: JoinHandle<Result<()>> = tokio::spawn(async move {
+            shutdown_notify.notified().await;
+            self.disable()?;
+
+            // We can't easily stop a CFRunLoop from another thread, so we just
+            // signal it to stop and it will exit on the next iteration or timeout
+            if let Some(handle) = self.monitor_thread.take() {
+                // Give it a moment to stop, but don't block forever
+                let _ = handle.join();
+            }
+            debug!("Stopped DNS change monitor");
+            Ok(())
+        });
+        Ok(handle)
     }
 
     /// Disables DNS forwarding and restores original settings.
@@ -240,7 +255,10 @@ impl DnsForwarder {
 
     /// Backs up current DNS settings from all network services.
     fn backup_dns_settings(&self, store: &SCDynamicStore) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| anyhow!("Mutex poisoned: {:?}", e))?;
         state.backup.clear();
 
         // Get all State:/.../DNS paths
@@ -341,7 +359,7 @@ impl DnsForwarder {
         self.should_stop
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let should_stop = Arc::clone(&self.should_stop);
+        let should_stop = self.should_stop.clone();
         let dns_server = self.dns_server_addr.to_string();
 
         let handle = thread::spawn(move || {
@@ -454,4 +472,21 @@ fn run_dns_monitor(should_stop: Arc<std::sync::atomic::AtomicBool>, expected_dns
     }
 
     info!("DNS change monitor stopped");
+}
+
+/// Sets up DNS in Forward mode (changes system DNS settings to point to our server).
+pub fn setup_dns_forward(
+    tun_ip: Ipv4Addr,
+    tun_name: String,
+    shutdown_notify: Arc<Notify>,
+) -> Result<JoinHandle<Result<()>>> {
+    // Create and enable the DNS forwarder
+    let forwarder = DnsForwarder::new(tun_ip, DNS_PORT, tun_name);
+
+    let handle = forwarder.enable(shutdown_notify)?;
+    info!(
+        "DNS forward mode enabled: system DNS -> {}:{}",
+        tun_ip, DNS_PORT
+    );
+    Ok(handle)
 }

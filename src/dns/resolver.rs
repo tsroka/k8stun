@@ -17,7 +17,7 @@ use hickory_resolver::Resolver;
 use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,22 +26,14 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
-use crate::dns::{build_formerr_response, DnsHandler, DnsQuery, K8sQueryType, PodDnsInfo};
+use crate::dns::query::{build_formerr_response, DnsHandler, DnsQuery, K8sQueryType, PodDnsInfo};
 use crate::k8s::K8sClient;
 use crate::vip::{PodId, ServiceId, TargetId, VipManager};
 
+use crate::dns::intercept::SystemDnsInfo;
 use itertools::Itertools;
 #[cfg(target_os = "macos")]
 use std::{ffi::CString, num::NonZeroU32};
-
-/// Configuration for the DNS resolver.
-#[derive(Clone)]
-pub struct DnsResolverConfig {
-    /// The upstream DNS server to forward non-K8s queries to.
-    pub upstream_dns: Ipv4Addr,
-    /// The network interface to bind to (bypasses TUN).
-    pub bind_interface: String,
-}
 
 /// A runtime provider that binds sockets to a specific network interface.
 /// This ensures DNS queries bypass the TUN device and go through the original interface.
@@ -232,22 +224,15 @@ pub struct DnsResolver {
 
 impl DnsResolver {
     /// Creates a new DNS resolver with the given configuration.
-    pub async fn new(
-        config: DnsResolverConfig,
+    pub fn new(
+        dns_info: SystemDnsInfo,
         dns_handler: Arc<DnsHandler>,
         vip_manager: VipManager,
         k8s_client: Arc<K8sClient>,
-    ) -> Result<Self> {
-        info!(
-            "Creating DNS resolver with upstream {} via interface '{}'",
-            config.upstream_dns, config.bind_interface
-        );
-
+    ) -> Self {
         // Configure resolver to use the upstream DNS server
-        let name_server = NameServerConfig::new(
-            SocketAddr::new(config.upstream_dns.into(), 53),
-            Protocol::Udp,
-        );
+        let name_server =
+            NameServerConfig::new(SocketAddr::new(dns_info.ip.into(), 53), Protocol::Udp);
 
         let resolver_config = ResolverConfig::from_parts(None, vec![], vec![name_server]);
 
@@ -257,7 +242,7 @@ impl DnsResolver {
         resolver_opts.attempts = 2;
 
         // Create the interface-bound runtime provider
-        let runtime_provider = InterfaceBoundRuntimeProvider::new(config.bind_interface.clone());
+        let runtime_provider = InterfaceBoundRuntimeProvider::new(dns_info.bind_interface.clone());
         let connector = GenericConnector::new(runtime_provider);
 
         let upstream_resolver = Resolver::builder_with_config(resolver_config, connector)
@@ -266,15 +251,15 @@ impl DnsResolver {
 
         debug!(
             "DNS resolver created, bound to interface '{}'",
-            config.bind_interface
+            dns_info.bind_interface
         );
 
-        Ok(Self {
+        Self {
             upstream_resolver,
             dns_handler,
             vip_manager,
             k8s_client,
-        })
+        }
     }
 
     /// Resolves a DNS query and returns the response message.
@@ -450,43 +435,5 @@ impl DnsResolver {
         // For unparseable queries, return FORMERR (format error) response
         debug!("Cannot forward unparseable DNS query, returning FORMERR");
         Ok(build_formerr_response(dns_data))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arc_swap::ArcSwap;
-    use std::collections::HashSet;
-
-    fn make_namespace_set(namespaces: Vec<&str>) -> crate::k8s::NamespaceSet {
-        Arc::new(ArcSwap::from_pointee(
-            namespaces
-                .into_iter()
-                .map(String::from)
-                .collect::<HashSet<_>>(),
-        ))
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Kubernetes cluster connection"]
-    async fn test_resolver_creation() {
-        // This test requires a running Kubernetes cluster to create a K8sClient
-        // Run with: cargo test -- --ignored
-        let config = DnsResolverConfig {
-            upstream_dns: Ipv4Addr::new(8, 8, 8, 8),
-            bind_interface: "en0".to_string(),
-        };
-
-        let dns_handler = Arc::new(DnsHandler::new(make_namespace_set(vec!["default"])));
-        let vip_manager = VipManager::new(Ipv4Addr::new(198, 18, 0, 0));
-        let k8s_client = Arc::new(
-            K8sClient::new(None)
-                .await
-                .expect("Failed to create K8s client"),
-        );
-
-        let resolver = DnsResolver::new(config, dns_handler, vip_manager, k8s_client).await;
-        assert!(resolver.is_ok());
     }
 }

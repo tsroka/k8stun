@@ -1,0 +1,25 @@
+# Build artifacts
+target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation (not needed for build)
+*.md
+!README.md
+
+# Licenses (not needed for build)
+LICENSE-*
+
+# Release configuration
+cliff.toml
+RELEASING.md
+

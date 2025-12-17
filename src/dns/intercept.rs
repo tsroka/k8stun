@@ -8,6 +8,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
+use std::fmt::Display;
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::str::FromStr;
@@ -24,7 +25,6 @@ pub enum DnsMode {
     TunRoute,
     /// Change system DNS settings to point to our DNS server (macOS only).
     /// This modifies the system's DNS configuration via SCDynamicStore.
-    #[cfg(target_os = "macos")]
     Forward,
 }
 
@@ -53,29 +53,35 @@ impl FromStr for DnsMode {
         }
     }
 }
-
-/// Configuration for DNS interception.
 #[derive(Debug, Clone)]
-pub struct DnsInterceptConfig {
+pub struct SystemDnsInfo {
     /// The system's original DNS server that we'll intercept.
-    pub system_dns: Ipv4Addr,
+    pub ip: Ipv4Addr,
     /// The network interface name to bind to when forwarding DNS.
     /// This ensures forwarded queries bypass the TUN.
     pub bind_interface: String,
 }
 
-impl Default for DnsInterceptConfig {
-    fn default() -> Self {
-        Self {
-            system_dns: Ipv4Addr::new(0, 0, 0, 0), // Will be detected
-            bind_interface: String::new(),         // Will be detected
-        }
+impl SystemDnsInfo {
+    pub fn detect() -> Result<Self> {
+        // Detect system DNS and interface for upstream forwarding
+        let system_dns = detect_system_dns()?;
+
+        let bind_interface = detect_default_interface_name()?;
+        Ok(Self {
+            ip: system_dns,
+            bind_interface,
+        })
     }
 }
 
+impl Display for SystemDnsInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Ip: {}, Interface: {}", self.ip, self.bind_interface)
+    }
+}
 /// Manages DNS interception lifecycle.
 pub struct DnsInterceptor {
-    config: DnsInterceptConfig,
     original_route: Option<String>,
     tun_device_name: String,
 }
@@ -84,48 +90,30 @@ impl DnsInterceptor {
     /// Creates a new DNS interceptor.
     ///
     /// Detects the system DNS server and the interface to bind to for forwarding.
-    pub fn new(tun_device_name: String) -> Result<Self> {
-        let system_dns = detect_system_dns()?;
-        info!("Detected system DNS server: {}", system_dns);
-
-        // Detect the interface to use for forwarding (bypasses TUN)
-        let bind_interface = detect_default_interface_name()?;
-        info!(
-            "Will bind to interface '{}' for upstream DNS forwarding",
-            bind_interface
-        );
-
-        let config = DnsInterceptConfig {
-            system_dns,
-            bind_interface,
-        };
-
-        Ok(Self {
-            config,
+    pub fn new(tun_device_name: String) -> Self {
+        Self {
             original_route: None,
             tun_device_name,
-        })
+        }
     }
 
     /// Enables DNS interception by routing DNS traffic through the TUN.
-    pub fn enable(&mut self) -> Result<()> {
-        let dns_ip = self.config.system_dns;
-
+    pub fn enable(&mut self, dns_info: &SystemDnsInfo) -> Result<()> {
         // Don't intercept if system DNS is localhost or in our VIP range
-        if dns_ip.is_loopback() || is_in_vip_range(dns_ip) {
+        if dns_info.ip.is_loopback() || is_in_vip_range(dns_info.ip) {
             return Err(anyhow!(
                 "Cannot intercept DNS server {} - it's localhost or in VIP range",
-                dns_ip
+                dns_info.ip
             ));
         }
 
         info!(
             "Enabling DNS interception: {} -> TUN (forward via interface '{}')",
-            dns_ip, self.config.bind_interface
+            dns_info.ip, dns_info.bind_interface
         );
 
         // Save original route (if any) and add new route through TUN
-        self.add_dns_route()?;
+        self.add_dns_route(dns_info.ip)?;
 
         Ok(())
     }
@@ -137,19 +125,9 @@ impl DnsInterceptor {
         Ok(())
     }
 
-    /// Returns the system DNS server IP.
-    pub fn system_dns(&self) -> Ipv4Addr {
-        self.config.system_dns
-    }
-
-    /// Returns the interface name for upstream DNS forwarding.
-    pub fn bind_interface(&self) -> &str {
-        &self.config.bind_interface
-    }
-
     #[cfg(target_os = "macos")]
-    fn add_dns_route(&mut self) -> Result<()> {
-        let dns_ip = self.config.system_dns.to_string();
+    fn add_dns_route(&mut self, dns_ip: Ipv4Addr) -> Result<()> {
+        let dns_ip = dns_ip.to_string();
 
         // Add host route for DNS server through TUN
         let output = Command::new("route")
@@ -177,8 +155,8 @@ impl DnsInterceptor {
     }
 
     #[cfg(target_os = "linux")]
-    fn add_dns_route(&mut self) -> Result<()> {
-        let dns_ip = self.config.system_dns.to_string();
+    fn add_dns_route(&mut self, dns_ip: Ipv4Addr) -> Result<()> {
+        let dns_ip = dns_ip.to_string();
 
         let output = Command::new("ip")
             .args(["route", "add", &dns_ip, "dev", &self.tun_device_name])

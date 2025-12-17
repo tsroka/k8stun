@@ -6,10 +6,6 @@
 
 mod api;
 mod dns;
-#[cfg(target_os = "macos")]
-mod dns_forward_macos;
-mod dns_intercept;
-mod dns_resolver;
 mod k8s;
 mod pipe;
 mod stack;
@@ -23,13 +19,12 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::dns::build_servfail_response;
+use crate::dns::intercept::SystemDnsInfo;
+use crate::dns::query::{build_servfail_response, DnsHandler};
+use crate::dns::resolver::DnsResolver;
 use crate::stack::{AcceptedConnection, UdpPacket};
-use dns::DnsHandler;
-#[cfg(target_os = "macos")]
-use dns_forward_macos::DnsForwarder;
-use dns_intercept::{detect_default_interface_name, detect_system_dns, DnsInterceptor, DnsMode};
-use dns_resolver::{DnsResolver, DnsResolverConfig};
+use dns::intercept;
+use dns::intercept::{DnsInterceptor, DnsMode};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use k8s::{K8sClient, PodEndpoint};
@@ -40,6 +35,7 @@ use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tun::{TunConfig, TunDevice};
 use vip::{PodId, ServiceId, TargetId, VipManager, VipManagerConfig};
 
@@ -88,7 +84,7 @@ struct Args {
     /// - tun_route: Route DNS traffic through TUN device (works on all platforms)
     /// - forward: Change system DNS settings to use our DNS server (macOS only)
     #[arg(long, default_value = "tun_route", value_enum)]
-    dns_mode: dns_intercept::DnsMode,
+    dns_mode: intercept::DnsMode,
 
     /// Kubernetes context to use (from kubeconfig). If not specified, uses current context.
     #[arg(short = 'c', long)]
@@ -122,8 +118,10 @@ async fn main() -> Result<()> {
         .with_line_number(args.log_source)
         .compact()
         .init();
+    let shutdown_notify = Arc::new(Notify::new());
 
     info!("Starting k8stun - Kubernetes Userspace Network Tunnel");
+    let components = FuturesUnordered::new();
 
     // Parse namespaces
     let namespaces: Vec<String> = args
@@ -215,59 +213,52 @@ async fn main() -> Result<()> {
         .into_async_device()
         .context("Failed to extract async device from TUN")?;
 
-
     // Set up DNS based on mode
-    let mut dns_interceptor: Option<DnsInterceptor> = None;
-    #[cfg(target_os = "macos")]
-    let mut dns_forwarder: Option<DnsForwarder> = None;
-    let dns_resolver: Option<Arc<DnsResolver>> = match args.dns_mode {
+    let dns_interceptor: Option<DnsInterceptor> = None;
+    let dns_resolver: Option<DnsResolver> = match args.dns_mode {
         DnsMode::Disabled => {
             info!("DNS interception is disabled");
             None
         }
-        DnsMode::TunRoute => {
-            info!("Setting up DNS interception (tun_route mode)...");
-            setup_dns_tun_route(
-                tun_name.clone(),
-                &dns_handler,
-                &vip_manager,
-                &k8s_client,
-                &mut dns_interceptor,
-            )
-            .await
-        }
-        #[cfg(target_os = "macos")]
-        DnsMode::Forward => {
+        dns_mode => {
+            let dns_info =
+                SystemDnsInfo::detect().context("Failed to detect system dns configuration.")?;
+            info!("Enabled TUN DNS resolver, system configuration: {dns_info}.");
+            let resolver = DnsResolver::new(
+                dns_info.clone(),
+                dns_handler.clone(),
+                vip_manager.clone(),
+                k8s_client.clone(),
+            );
 
-            {
-                info!("Setting up DNS forwarding (forward mode)...");
-                // TUN interface IP address (used for DNS server)
-                let tun_ip = Ipv4Addr::new(args.vip_base.octets()[0], args.vip_base.octets()[1], 0, 1);
+            let handle_or_err = match dns_mode {
+                DnsMode::Disabled => unreachable!(), // We already handled this above
+                DnsMode::TunRoute => {
+                    info!("Setting up DNS interception (tun_route mode)...");
 
-                setup_dns_forward(
-                    tun_ip,
-                    tun_name.clone(),
-                    &dns_handler,
-                    &vip_manager,
-                    &k8s_client,
-                    &mut dns_forwarder,
-                )
-                .await
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                warn!(
-                    "DNS forward mode is only supported on macOS. Falling back to tun_route mode."
-                );
-                setup_dns_tun_route(
-                    tun_name.clone(),
-                    &dns_handler,
-                    &vip_manager,
-                    &k8s_client,
-                    &mut dns_interceptor,
-                )
-                .await
-            }
+                    setup_dns_tun_route(tun_name.clone(), &dns_info, shutdown_notify.clone())
+                }
+                #[cfg(target_os = "macos")]
+                DnsMode::Forward => {
+                    info!("Setting up DNS forwarding (forward mode)...");
+                    // TUN interface IP address (used for DNS server)
+                    let tun_ip =
+                        Ipv4Addr::new(args.vip_base.octets()[0], args.vip_base.octets()[1], 0, 1);
+
+                    dns::forward_macos::setup_dns_forward(
+                        tun_ip,
+                        tun_name.clone(),
+                        shutdown_notify.clone(),
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                DnsMode::Forward => {
+                    panic!("DNS forward mode is not supported on the current platform.")
+                }
+            };
+            let handle = handle_or_err.context("Failed to set up DNS interception")?;
+            components.push(handle);
+            Some(resolver)
         }
     };
 
@@ -343,15 +334,13 @@ async fn main() -> Result<()> {
     info!("Press Ctrl+C to stop.");
     info!("");
 
-    let shutdown_notify = Arc::new(Notify::new());
-
     let (tcp, udp_rx, udp_tx) = network_stack.split();
-    let components = FuturesUnordered::new();
 
     let tcp_shutdown = shutdown_notify.clone();
     let tcp_loop_handle = tokio::spawn(async move {
         tcp_loop(k8s_client, vip_manager, tcp, tcp_shutdown).await;
         info!("TCP loop stopped");
+        Ok(())
     });
     components.push(tcp_loop_handle);
     let udp_shutdown = shutdown_notify.clone();
@@ -359,6 +348,7 @@ async fn main() -> Result<()> {
     let udp_loop_handle = tokio::spawn(async move {
         udp_loop(udp_tx, udp_rx, dns_resolver, udp_shutdown).await;
         info!("UDP loop stopped");
+        Ok(())
     });
     components.push(udp_loop_handle);
 
@@ -380,177 +370,24 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Cleanup DNS forwarder (macOS forward mode)
-    #[cfg(target_os = "macos")]
-    if let Some(mut forwarder) = dns_forwarder {
-        if let Err(e) = forwarder.disable() {
-            warn!("Failed to disable DNS forwarder: {}", e);
-        }
-    }
-
     info!("k8stun stopped");
     Ok(())
 }
 
 /// Sets up DNS in TunRoute mode (routes DNS traffic through TUN).
-async fn setup_dns_tun_route(
+fn setup_dns_tun_route(
     tun_name: String,
-    dns_handler: &Arc<DnsHandler>,
-    vip_manager: &VipManager,
-    k8s_client: &Arc<K8sClient>,
-    dns_interceptor: &mut Option<DnsInterceptor>,
-) -> Option<Arc<DnsResolver>> {
-    match DnsInterceptor::new(tun_name) {
-        Ok(mut interceptor) => match interceptor.enable() {
-            Ok(()) => {
-                info!(
-                    "DNS interception enabled: {} -> TUN (forward via interface '{}')",
-                    interceptor.system_dns(),
-                    interceptor.bind_interface()
-                );
-
-                // Create the DNS resolver with upstream configuration
-                let resolver_config = DnsResolverConfig {
-                    upstream_dns: interceptor.system_dns(),
-                    bind_interface: interceptor.bind_interface().to_string(),
-                };
-
-                match DnsResolver::new(
-                    resolver_config,
-                    Arc::clone(dns_handler),
-                    vip_manager.clone(),
-                    Arc::clone(k8s_client),
-                )
-                .await
-                {
-                    Ok(resolver) => {
-                        *dns_interceptor = Some(interceptor);
-                        Some(Arc::new(resolver))
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create DNS resolver: {}. Continuing without it.",
-                            e
-                        );
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to enable DNS interception: {}. Continuing without it.",
-                    e
-                );
-                None
-            }
-        },
-        Err(e) => {
-            warn!(
-                "Failed to set up DNS interceptor: {}. Continuing without it.",
-                e
-            );
-            None
-        }
-    }
-}
-
-/// Sets up DNS in Forward mode (changes system DNS settings to point to our server).
-#[cfg(target_os = "macos")]
-/// DNS port - always use standard port 53
-const DNS_PORT: u16 = 53;
-
-#[cfg(target_os = "macos")]
-async fn setup_dns_forward(
-    tun_ip: Ipv4Addr,
-    tun_name: String,
-    dns_handler: &Arc<DnsHandler>,
-    vip_manager: &VipManager,
-    k8s_client: &Arc<K8sClient>,
-    dns_forwarder: &mut Option<DnsForwarder>,
-) -> Option<Arc<DnsResolver>> {
-    // Detect system DNS and interface for upstream forwarding
-    let system_dns = match detect_system_dns() {
-        Ok(dns) => {
-            info!("Detected system DNS server: {}", dns);
-            dns
-        }
-        Err(e) => {
-            warn!(
-                "Failed to detect system DNS: {}. Continuing without DNS.",
-                e
-            );
-            return None;
-        }
-    };
-
-    let bind_interface = match detect_default_interface_name() {
-        Ok(iface) => {
-            info!(
-                "Will bind to interface '{}' for upstream DNS forwarding",
-                iface
-            );
-            iface
-        }
-        Err(e) => {
-            warn!(
-                "Failed to detect default interface: {}. Continuing without DNS.",
-                e
-            );
-            return None;
-        }
-    };
-
-    // Create the DNS resolver
-    let resolver_config = DnsResolverConfig {
-        upstream_dns: system_dns,
-        bind_interface,
-    };
-
-    let resolver = match DnsResolver::new(
-        resolver_config,
-        Arc::clone(dns_handler),
-        vip_manager.clone(),
-        Arc::clone(k8s_client),
-    )
-    .await
-    {
-        Ok(r) => Arc::new(r),
-        Err(e) => {
-            warn!(
-                "Failed to create DNS resolver: {}. Continuing without it.",
-                e
-            );
-            return None;
-        }
-    };
-
-    // Create and enable the DNS forwarder
-    match DnsForwarder::new(tun_ip, DNS_PORT, tun_name) {
-        Ok(mut forwarder) => match forwarder.enable() {
-            Ok(()) => {
-                info!(
-                    "DNS forward mode enabled: system DNS -> {}:{}",
-                    tun_ip, DNS_PORT
-                );
-                *dns_forwarder = Some(forwarder);
-                Some(resolver)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to enable DNS forwarder: {}. Continuing without it.",
-                    e
-                );
-                None
-            }
-        },
-        Err(e) => {
-            warn!(
-                "Failed to create DNS forwarder: {}. Continuing without it.",
-                e
-            );
-            None
-        }
-    }
+    dns_info: &SystemDnsInfo,
+    shutdown_notify: Arc<Notify>,
+) -> Result<JoinHandle<Result<()>>> {
+    let mut interceptor = DnsInterceptor::new(tun_name);
+    interceptor.enable(dns_info)?;
+    let handle = tokio::spawn(async move {
+        shutdown_notify.notified().await;
+        debug!("Removing DNS tun route");
+        interceptor.disable()
+    });
+    Ok(handle)
 }
 
 async fn dns_responder(
@@ -589,7 +426,7 @@ async fn dns_responder(
 async fn udp_loop(
     mut udp_rx: Receiver<UdpPacket>,
     mut udp_tx: Sender<UdpPacket>,
-    dns_resolver: Option<Arc<DnsResolver>>,
+    dns_resolver: Option<DnsResolver>,
     shutdown: Arc<Notify>,
 ) {
     loop {
